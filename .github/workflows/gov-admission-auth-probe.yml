@@ -1,0 +1,268 @@
+name: GOV-ADMISSION-05 — verifica identità e perimetro App
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Modalità di verifica (nessuna pubblicazione)
+        required: true
+        type: choice
+        default: synthetic
+        options:
+          - synthetic
+          - authenticate
+permissions: {}
+concurrency:
+  group: gov-admission-auth-probe
+  cancel-in-progress: false
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Reject unauthorized context explicitly (no credentials)
+        shell: bash
+        env:
+          GOV_REQUESTED_MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          deny() { printf 'HOLD: unauthorized workflow context (%s)\n' "$1" >&2; exit 1; }
+          [[ "$GITHUB_REPOSITORY" == antoniocorsano-boop/registro-docente-governance ]] || deny repository
+          [[ "$GITHUB_REF" == refs/heads/main ]] || deny ref
+          [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]] || deny event
+          [[ "$GITHUB_RUN_ATTEMPT" == 1 ]] || deny attempt
+          [[ "$GITHUB_ACTOR_ID" == 233439245 ]] || deny actor
+          [[ "$GITHUB_TRIGGERING_ACTOR" == antoniocorsano-boop ]] || deny triggering_actor
+          [[ "$GITHUB_WORKFLOW_REF" == antoniocorsano-boop/registro-docente-governance/.github/workflows/gov-admission-auth-probe.yml@refs/heads/main ]] || deny workflow_ref
+          [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]] || deny run_id
+          case "$GOV_REQUESTED_MODE" in synthetic|authenticate) ;; *) deny mode ;; esac
+          echo 'CONTEXT_PASS'
+  qualification:
+    needs: preflight
+    if: github.repository == 'antoniocorsano-boop/registro-docente-governance' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.run_attempt == 1 && github.actor_id == '233439245' && github.triggering_actor == 'antoniocorsano-boop'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - &prepare_sources
+        name: Verify context and prepare qualified sources (no secrets)
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = antoniocorsano-boop/registro-docente-governance
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$GITHUB_ACTOR_ID" = 233439245
+          test "$GITHUB_TRIGGERING_ACTOR" = antoniocorsano-boop
+          test "$GITHUB_WORKFLOW_REF" = antoniocorsano-boop/registro-docente-governance/.github/workflows/gov-admission-auth-probe.yml@refs/heads/main
+          umask 077
+          mkdir "$RUNNER_TEMP/gov-admission-05"
+          cd "$RUNNER_TEMP/gov-admission-05"
+          cat > auth_probe.py <<'GOV05_END_0'
+          """GOV-ADMISSION-05: App identity and installation scope probe. No check publication."""
+          import base64, json, os, re, subprocess, time
+          from urllib.request import Request, build_opener, HTTPRedirectHandler
+          from urllib.error import URLError
+          
+          APP=5948191
+          OWNER=('antoniocorsano-boop',233439245)
+          REPO='antoniocorsano-boop/registro-docente'
+          RID=1428043626
+          GOV='antoniocorsano-boop/registro-docente-governance'
+          WORKFLOW='.github/workflows/gov-admission-auth-probe.yml'
+          APP_PERMS={'actions':'read','checks':'write','statuses':'write','contents':'read','metadata':'read','pull_requests':'read'}
+          READ_PERMS={k:'read' for k in APP_PERMS}
+          class Hold(Exception): pass
+          def require(value,label):
+              if not value: raise Hold(label)
+          
+          def guard(env):
+              expected={'GITHUB_REPOSITORY':GOV,'GITHUB_REF':'refs/heads/main','GITHUB_EVENT_NAME':'workflow_dispatch','GITHUB_RUN_ATTEMPT':'1','GITHUB_WORKFLOW_REF':GOV+'/'+WORKFLOW+'@refs/heads/main','GITHUB_ACTOR_ID':str(OWNER[1]),'GITHUB_TRIGGERING_ACTOR':OWNER[0],'GOV_ADMISSION_MODE':'authenticate'}
+              for key,value in expected.items(): require(env.get(key)==value,'context '+key)
+              require(re.fullmatch(r'[1-9][0-9]{0,19}',env.get('GITHUB_RUN_ID','')) is not None,'run identity')
+          
+          def b64(data): return base64.urlsafe_b64encode(data).rstrip(b'=')
+          def jwt(key, now=None):
+              require(isinstance(key,str) and 0<len(key)<32768,'key unavailable')
+              now=int(time.time() if now is None else now)
+              message=b64(b'{"alg":"RS256","typ":"JWT"}')+b'.'+b64(json.dumps({'iat':now-60,'exp':now+480,'iss':str(APP)},separators=(',',':')).encode())
+              # Linux runner: key lives in anonymous memory-backed FD, never a named file.
+              fd=os.memfd_create('gov-auth-key',os.MFD_CLOEXEC)
+              try:
+                  with os.fdopen(os.dup(fd),'wb') as stream: stream.write(key.encode())
+                  os.lseek(fd,0,os.SEEK_SET)
+                  p=subprocess.run(['/usr/bin/openssl','dgst','-sha256','-sign',f'/proc/self/fd/{fd}','-passin','pass:'],input=message,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,pass_fds=(fd,),env={'PATH':'/usr/bin:/bin'},timeout=10,check=False)
+                  require(p.returncode==0 and len(p.stdout)>=256,'signature failed')
+                  return (message+b'.'+b64(p.stdout)).decode('ascii')
+              finally: os.close(fd)
+          
+          class NoRedirect(HTTPRedirectHandler):
+              def redirect_request(self,*args,**kwargs): return None
+          
+          class Transport:
+              def __init__(self,opener=None): self.opener=opener or build_opener(NoRedirect())
+              def request(self,method,path,credential,body=None):
+                  fixed={'/app','/app/installations?per_page=100','/repos/'+REPO+'/installation','/installation/repositories?per_page=100'}
+                  token_path=re.fullmatch(r'/app/installations/[1-9][0-9]{0,19}/access_tokens',path)
+                  allowed=(method=='GET' and path in fixed and body is None) or (method=='POST' and token_path and body=={'permissions':READ_PERMS}) or (method=='DELETE' and path=='/installation/token' and body is None)
+                  require(allowed,'transport route or payload')
+                  require(isinstance(credential,str) and credential and not any(c.isspace() for c in credential),'credential invalid')
+                  url='https://api.github.com'+path
+                  headers={'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28','User-Agent':'Registro-Docente-Governance-Auth-Probe','Authorization':'Bearer '+credential}
+                  if body is not None: headers['Content-Type']='application/json'
+                  req=Request(url, data=None if body is None else json.dumps(body).encode(),headers=headers,method=method)
+                  with self.opener.open(req,timeout=20) as f:
+                      require(f.geturl()==url,'response endpoint')
+                      require(f.status=={'GET':200,'POST':201,'DELETE':204}[method],'response status')
+                      require('rel="next"' not in f.headers.get('Link',''),'pagination not exhausted')
+                      data=f.read(4_000_001); require(len(data)<=4_000_000,'response too large')
+                      return None if method=='DELETE' else json.loads(data)
+          
+          def owner(record): return (record['login'],record['id'])==OWNER
+          
+          def probe(credential,request):
+              app=request('GET','/app',credential)
+              require(app['id']==APP and owner(app['owner']),'App identity')
+              require(app['permissions']==APP_PERMS and app['events']==[],'App permission contract')
+              installations=request('GET','/app/installations?per_page=100',credential)
+              require(isinstance(installations,list) and len(installations)==1,'installation count')
+              i=installations[0]
+              require(type(i['id']) is int and i['id']>0 and i['app_id']==APP and owner(i['account']) and i['target_id']==OWNER[1] and i['target_type']=='User','installation identity')
+              require(i['repository_selection']=='selected' and i['suspended_at'] is None and i['permissions']==APP_PERMS and i['events']==[],'installation contract')
+              matched=request('GET','/repos/'+REPO+'/installation',credential)
+              require(matched['id']==i['id'] and matched['app_id']==APP,'repository installation identity')
+              # Do NOT narrow repositories here: the point is to see the entire installed scope.
+              result=request('POST',f'/app/installations/{i["id"]}/access_tokens',credential,{'permissions':READ_PERMS})
+              token=result.get('token')
+              require(isinstance(token,str) and token and not any(c.isspace() for c in token),'token missing')
+              try:
+                  require(result['permissions']==READ_PERMS,'token not read-only')
+                  scope=request('GET','/installation/repositories?per_page=100',token)
+                  require(scope['total_count']==len(scope['repositories'])==1,'installation scope')
+                  r=scope['repositories'][0]
+                  require((r['id'],r['full_name'])==(RID,REPO),'repository identity')
+              finally:
+                  request('DELETE','/installation/token',token)
+              return {'state':'AUTH_SCOPE_PASS','app_id':APP,'installation_id':i['id'],'repository_count':1,'token_revoked':True,'check_published':False,'release_authorized':False}
+          
+          if __name__=='__main__':
+              try:
+                  guard(os.environ)
+                  key=os.environ.pop('GOV_APP_PRIVATE_KEY','')
+                  credential=jwt(key); del key
+                  print(json.dumps(probe(credential,Transport().request),sort_keys=True))
+              except (Hold,URLError,OSError,ValueError,TypeError,KeyError,IndexError,subprocess.SubprocessError) as e:
+                  # Never render exception data from HTTP, keys, or credentials.
+                  print('HOLD: '+(str(e) if isinstance(e,Hold) else type(e).__name__))
+                  raise SystemExit(1)
+          GOV05_END_0
+          cat > test_auth_probe.py <<'GOV05_END_1'
+          import unittest, copy, os, subprocess, tempfile, json, base64
+          import auth_probe as a
+          
+          class Tests(unittest.TestCase):
+              def fixture(self):
+                  own={'login':a.OWNER[0],'id':a.OWNER[1]}
+                  i={'id':42,'app_id':a.APP,'account':own,'target_id':a.OWNER[1],'target_type':'User','repository_selection':'selected','suspended_at':None,'permissions':copy.deepcopy(a.APP_PERMS),'events':[]}
+                  return {'/app':{'id':a.APP,'owner':own,'permissions':copy.deepcopy(a.APP_PERMS),'events':[]},'/app/installations?per_page=100':[i],'/repos/'+a.REPO+'/installation':copy.deepcopy(i),'/app/installations/42/access_tokens':{'token':'synthetic','permissions':copy.deepcopy(a.READ_PERMS)},'/installation/repositories?per_page=100':{'total_count':1,'repositories':[{'id':a.RID,'full_name':a.REPO}]},'/installation/token':None}
+              def run_probe(self,d,calls):
+                  def request(m,p,c,b=None):
+                      calls.append((m,p,c,b))
+                      return d[p]
+                  return a.probe('fake-jwt',request)
+              def test_valid(self):
+                  calls=[]; r=self.run_probe(self.fixture(),calls)
+                  self.assertEqual(r['state'],'AUTH_SCOPE_PASS'); self.assertFalse(r['check_published']); self.assertTrue(r['token_revoked'])
+                  self.assertEqual([x[0] for x in calls],['GET','GET','GET','POST','GET','DELETE'])
+                  self.assertEqual(calls[3][3],{'permissions':a.READ_PERMS}); self.assertEqual(calls[-1][2],'synthetic')
+              def test_app_and_installation_fail_closed(self):
+                  for mutate in [lambda d:d['/app'].update(id=7),lambda d:d['/app']['owner'].update(id=2),lambda d:d['/app']['permissions'].update(administration='write'),lambda d:d['/app'].update(events=['push']),lambda d:d['/app/installations?per_page=100'].clear(),lambda d:d['/app/installations?per_page=100'].append({}),lambda d:d['/app/installations?per_page=100'][0].update(repository_selection='all'),lambda d:d['/app/installations?per_page=100'][0].update(suspended_at='date'),lambda d:d['/app/installations?per_page=100'][0].update(target_id=8),lambda d:d['/repos/'+a.REPO+'/installation'].update(id=8)]:
+                      with self.subTest(mutate=mutate):
+                          d=self.fixture(); mutate(d); calls=[]
+                          with self.assertRaises(a.Hold): self.run_probe(d,calls)
+                          self.assertFalse(any(c[0]=='POST' for c in calls))
+              def test_scope_and_permissions_failure_revokes(self):
+                  for mutate in [lambda d:d['/app/installations/42/access_tokens']['permissions'].update(checks='write'),lambda d:d['/installation/repositories?per_page=100'].update(total_count=2),lambda d:d['/installation/repositories?per_page=100']['repositories'][0].update(id=0),lambda d:d['/installation/repositories?per_page=100']['repositories'][0].update(full_name='other/repo')]:
+                      with self.subTest(mutate=mutate):
+                          d=self.fixture(); mutate(d); calls=[]
+                          with self.assertRaises(a.Hold): self.run_probe(d,calls)
+                          self.assertEqual(calls[-1][0:2],('DELETE','/installation/token'))
+              def test_revoke_failure_no_pass(self):
+                  d=self.fixture(); del d['/installation/token']; calls=[]
+                  with self.assertRaises(KeyError): self.run_probe(d,calls)
+              def test_context(self):
+                  env={'GITHUB_REPOSITORY':a.GOV,'GITHUB_REF':'refs/heads/main','GITHUB_EVENT_NAME':'workflow_dispatch','GITHUB_RUN_ATTEMPT':'1','GITHUB_WORKFLOW_REF':a.GOV+'/'+a.WORKFLOW+'@refs/heads/main','GITHUB_ACTOR_ID':str(a.OWNER[1]),'GITHUB_TRIGGERING_ACTOR':a.OWNER[0],'GITHUB_RUN_ID':'42','GOV_ADMISSION_MODE':'authenticate'}
+                  a.guard(env)
+                  for key in env:
+                      with self.subTest(key=key):
+                          bad=dict(env); bad[key]='invalid'
+                          with self.assertRaises(a.Hold): a.guard(bad)
+              def test_transport_denies_publication(self):
+                  t=a.Transport()
+                  for m,p,b in [('POST','/repos/'+a.REPO+'/check-runs',{}),('POST','/app/installations/42/access_tokens',{'permissions':a.APP_PERMS}),('POST','/app/installations/42/access_tokens',{'permissions':a.READ_PERMS,'repository_ids':[a.RID]}),('GET','/repos/other/repo',None),('DELETE','/repos/'+a.REPO,None)]:
+                      with self.subTest(p=p,m=m):
+                          with self.assertRaises(a.Hold): t.request(m,p,'synthetic',b)
+              def test_rsa_signature_real_synthetic_key(self):
+                  key=subprocess.check_output(['/usr/bin/openssl','genpkey','-algorithm','RSA','-pkeyopt','rsa_keygen_bits:2048'],stderr=subprocess.DEVNULL)
+                  pub=subprocess.check_output(['/usr/bin/openssl','pkey','-pubout'],input=key,stderr=subprocess.DEVNULL)
+                  head,payload,sig=a.jwt(key.decode(),now=1000).split('.')
+                  dec=lambda x:base64.urlsafe_b64decode(x+'='*(-len(x)%4))
+                  self.assertEqual(json.loads(dec(payload)),{'iat':940,'exp':1480,'iss':str(a.APP)})
+                  with tempfile.TemporaryDirectory() as td:
+                      for name,data in [('pub.pem',pub),('sig',dec(sig))]:
+                          with open(os.path.join(td,name),'wb') as f:f.write(data)
+                      result=subprocess.run(['/usr/bin/openssl','dgst','-sha256','-verify',td+'/pub.pem','-signature',td+'/sig'],input=(head+'.'+payload).encode(),capture_output=True)
+                      self.assertEqual(result.returncode,0)
+                  with self.assertRaises(a.Hold): a.jwt('invalid')
+          
+          if __name__=='__main__': unittest.main(verbosity=2)
+          GOV05_END_1
+          cat > SHA256SUMS <<'GOV05_END_2'
+          75098866cf79559bd46dfc36cd139c954698c6e9549455732b6abebeed5e8c36  auth_probe.py
+          f4875a62cd7c45b7706dda55da69d42d80559f9e4bb5254818def0d252160515  test_auth_probe.py
+          GOV05_END_2
+          sha256sum -c SHA256SUMS
+      - name: Run synthetic regressions (no secrets)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/gov-admission-05"
+          python3 -m unittest -v test_auth_probe
+  authenticate:
+    needs: [preflight, qualification]
+    if: github.repository == 'antoniocorsano-boop/registro-docente-governance' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.run_attempt == 1 && github.actor_id == '233439245' && github.triggering_actor == 'antoniocorsano-boop' && inputs.mode == 'authenticate'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: GOV-ADMISSION
+    steps:
+      - *prepare_sources
+      - name: Verify actual App and installation (read-only token; no publication)
+        shell: bash
+        env:
+          GOV_ADMISSION_MODE: authenticate
+          GOV_APP_PRIVATE_KEY: ${{ secrets.GOV_APP_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/gov-admission-05"
+          sha256sum -c SHA256SUMS
+          python3 auth_probe.py
+  outcome:
+    needs: [preflight, qualification, authenticate]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Require actual completion (no credentials)
+        shell: bash
+        env:
+          PREFLIGHT_RESULT: ${{ needs.preflight.result }}
+          QUALIFICATION_RESULT: ${{ needs.qualification.result }}
+          AUTHENTICATION_RESULT: ${{ needs.authenticate.result }}
+          GOV_REQUESTED_MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          [[ "$PREFLIGHT_RESULT" == success && "$QUALIFICATION_RESULT" == success ]] || { echo 'HOLD: mandatory job did not succeed' >&2; exit 1; }
+          case "$GOV_REQUESTED_MODE:$AUTHENTICATION_RESULT" in
+            synthetic:skipped|authenticate:success) ;;
+            *) echo 'HOLD: authentication outcome inconsistent with mode' >&2; exit 1 ;;
+          esac
+          echo 'MANDATORY_JOBS_PASS'

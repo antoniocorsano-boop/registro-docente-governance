@@ -1,0 +1,231 @@
+"""GOV-AUTO-01: automatic admission from an approved protected-main manifest.
+No candidate checkout, execution, merge, or release. Policy changes require review.
+"""
+import json
+import os
+import re
+import sys
+from pathlib import Path
+from urllib.request import Request, build_opener
+
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT / 'qualified'))
+import verify_remote as old
+
+GOV = 'antoniocorsano-boop/registro-docente-governance'
+APP = 5948191
+INSTALLATION = 186423539
+OWNER = '233439245'
+CHECK = 'gov-admission-independent'
+OUTPUT = {'title':'Independent exact-candidate evidence verified','summary':'12 workflows, 23 jobs; evidence only. Not a merge or release authorization.'}
+POLICY = 'RD-12-23-V1'
+WORKFLOW = '.github/workflows/gov-auto.yml'
+PATHS = {
+    391941854: ('predeploy-security-qualification.yml', 'a46b6a9a4a0c846312ae794b1c246dd4d4eaa76f'),
+    408579107: ('header-01-isolated-qualification.yml', '63a702f1cb45888efb8f7c33a44cb100344bc51c'),
+    416379230: ('behavior-integrity-qualification.yml', 'd0205c714ef623348cf398c411f81d0f5c387461'),
+    416154802: ('mobile-density-02-qualification.yml', '8443ac7dcd15e2703812051cfe34bcbcf4e74ce6'),
+    414966856: ('mobile-01-android-probe.yml', '3a8cce78e3d812d8d77121a19f0f82e747817fee'),
+    422912819: ('val01-native-evidence.yml', 'dd7cf0646cc0cc50f31b857b39ebf3eeeba98650'),
+    418894829: ('beta2-reference-qualification.yml', 'f0f710669a3c1ebc5ce3b1d6632cdf707d0dd5d7'),
+    394446897: ('browser-qualification.yml', '76a416dce21a7575fa4afcd6b95baa2e1b9333f2'),
+    427396129: ('ap02-f2-native-device.yml', 'c66a6983aca608751f8bd5b7ac53f80522beb0c6'),
+    404859404: ('flow-03-contract-qualification.yml', 'c7d899776f00cab27dedcd95cbd1247bf1cb04d9'),
+    419358552: ('beta2-archive-compatibility.yml', 'e4b8b92adb988c715950f0d0417f4b93fac18d71'),
+    401768724: ('qualification-invariants.yml', 'e95265520a314b44b2b43bf3e9fe7fd0a9caf90e'),
+}
+JOBS = {wid: tuple(names) for wid, names in old.RUNS.values()}
+ENTRIES = dict(old.ENTRIES)
+ENTRIES.update({'.github/workflows/' + path: blob for path, blob in PATHS.values()})
+
+class Hold(Exception): pass
+
+def need(ok, label):
+    if not ok: raise Hold(label)
+
+def sha(s): return isinstance(s, str) and re.fullmatch(r'[0-9a-f]{40}', s) is not None
+
+def number(n): return type(n) is int and 0 < n < 10**20
+
+def context(env):
+    fields = {'GITHUB_REPOSITORY': GOV, 'GITHUB_REF': 'refs/heads/main',
+              'GITHUB_REF_PROTECTED': 'true', 'GITHUB_EVENT_NAME': 'push',
+              'GITHUB_RUN_ATTEMPT': '1', 'GITHUB_ACTOR_ID': OWNER,
+              'GITHUB_TRIGGERING_ACTOR': 'antoniocorsano-boop',
+              'GITHUB_WORKFLOW_REF': GOV + '/' + WORKFLOW + '@refs/heads/main'}
+    for k, v in fields.items(): need(env.get(k) == v, 'context ' + k)
+    head = env.get('GITHUB_SHA')
+    need(sha(head) and head == env.get('GITHUB_WORKFLOW_SHA'), 'workflow SHA')
+    run = env.get('GITHUB_RUN_ID', '')
+    need(isinstance(run, str) and re.fullmatch(r'[1-9][0-9]{0,19}', run) is not None, 'run identity')
+    return run
+
+def manifest(m):
+    need(type(m) is dict and set(m) == {'schema','policy','pr','head','base','parent','tree','branch'}, 'manifest fields')
+    need(type(m['schema']) is int and m['schema'] == 1 and m['policy'] == POLICY and number(m['pr']), 'manifest policy/PR')
+    need(all(sha(m[k]) for k in ('head','base','parent','tree')) and m['head'] != m['base'], 'manifest SHA')
+    need(isinstance(m['branch'], str) and re.fullmatch(r'candidate/[A-Za-z0-9][A-Za-z0-9_-]{0,79}', m['branch']) is not None, 'candidate branch')
+    need(set(PATHS) == set(JOBS) and len(JOBS) == 12 and sum(map(len, JOBS.values())) == 23 and len(ENTRIES) == 14, 'fixed policy')
+    return m.copy()
+
+def complete(data, key):
+    rows = data[key]
+    need(isinstance(rows,list) and data['total_count'] == len(rows) and len(rows) < 100, 'incomplete API page')
+    return rows
+
+def check_pr(m, p):
+    need(p['number'] == m['pr'] and p['state'] == 'open' and p['merged'] is False, 'PR identity/state')
+    for key, ref, digest in [('head',m['branch'],m['head']),('base','main',m['base'])]:
+        q = p[key]
+        need((q['repo']['id'],q['repo']['full_name'],q['ref'],q['sha']) == (old.RID,old.REPO,ref,digest), 'PR ' + key)
+
+def check_base(m, fetch):
+    b = fetch('branches/main')
+    need(b['name'] == 'main' and b['commit']['sha'] == m['base'] and b['protected'] is True, 'main identity/protection')
+
+def final_candidate(m, fetch):
+    check_pr(m, fetch('pulls/' + str(m['pr'])))
+    check_base(m, fetch)
+
+def attestation(m, fetch):
+    rows = complete(fetch('commits/' + m['head'] + '/check-runs?per_page=100&filter=all'), 'check_runs')
+    same = [x for x in rows if x['name'] == CHECK]
+    if not same: return None
+    need(len(same) == 1, 'duplicate attestation')
+    c = same[0]
+    need((c['app']['id'],c['head_sha'],c['status'],c['conclusion']) == (APP,m['head'],'completed','success') and number(c['id']), 'conflicting attestation')
+    pattern = r'GOV-AUTO-01:' + POLICY + ':' + m['head'] + r':([1-9][0-9]{0,19})'
+    match = re.fullmatch(pattern, c['external_id'] or '')
+    # Only the already-qualified historical check is grandfathered into this policy.
+    if match is None:
+        need(m['head'] == old.HEAD and c['id'] == 140661146635 and c['external_id'] == 'GOV-ADMISSION-04:'+old.HEAD+':46044433279', 'historical attestation binding')
+        source_run = '46044433279'
+    else: source_run = match[1]
+    need(c['details_url'] == 'https://github.com/' + GOV + '/actions/runs/' + source_run, 'attestation provenance')
+    need(all(c['output'].get(k) == v for k,v in OUTPUT.items()), 'attestation evidence')
+    return c['id']
+
+def plan(m, fetch):
+    m = manifest(m)
+    final_candidate(m, fetch)
+    c = fetch('git/commits/' + m['head'])
+    need(c['sha'] == m['head'] and [x['sha'] for x in c['parents']] == [m['parent']] and c['tree']['sha'] == m['tree'], 'commit parent/tree')
+    t = fetch('git/trees/' + m['tree'] + '?recursive=1')
+    need(t['sha'] == m['tree'] and t['truncated'] is False, 'complete tree')
+    for path, digest in ENTRIES.items():
+        rows = [x for x in t['tree'] if x['path'] == path]
+        need(len(rows) == 1 and (rows[0]['sha'],rows[0]['mode'],rows[0]['type']) == (digest,'100644','blob'), 'policy blob drift')
+    runs = complete(fetch('actions/runs?head_sha=' + m['head'] + '&event=pull_request&per_page=100'), 'workflow_runs')
+    checks = complete(fetch('commits/' + m['head'] + '/check-runs?per_page=100&filter=latest'), 'check_runs')
+    ids = set(); run_ids = set()
+    for wid, names in JOBS.items():
+        matches = [w for w in runs if w['workflow_id'] == wid]
+        need(len(matches) == 1 and number(matches[0]['id']), 'missing/ambiguous workflow')
+        rid = matches[0]['id']
+        need(rid not in run_ids, 'duplicate run'); run_ids.add(rid)
+        w = fetch('actions/runs/' + str(rid))
+        need((w['id'],w['workflow_id'],w['path'],w['head_sha'],w['head_branch'],w['event'],w['run_attempt'],w['status'],w['conclusion'],w['repository']['id'],w['head_repository']['id']) == (rid,wid,'.github/workflows/'+PATHS[wid][0],m['head'],m['branch'],'pull_request',1,'completed','success',old.RID,old.RID), 'workflow provenance')
+        related = [p for p in w['pull_requests'] if p['number'] == m['pr'] and p['head']['sha'] == m['head'] and p['head']['ref'] == m['branch'] and p['head']['repo']['id'] == old.RID and p['base']['sha'] == m['base'] and p['base']['ref'] == 'main' and p['base']['repo']['id'] == old.RID]
+        need(len(related) == 1, 'workflow PR binding')
+        jobs = complete(fetch('actions/runs/' + str(rid) + '/jobs?per_page=100'), 'jobs')
+        need(sorted(x['name'] for x in jobs) == sorted(names), 'job matrix')
+        for j in jobs:
+            need(number(j['id']) and j['id'] not in ids and (j['run_id'],j['head_sha'],j['status'],j['conclusion']) == (rid,m['head'],'completed','success'), 'job evidence')
+            same = [x for x in checks if x['name'] == j['name'] and x['app']['id'] == old.APP]
+            need(len(same) == 1, 'ambiguous job check')
+            ch = same[0]
+            need((ch['id'],ch['head_sha'],ch['status'],ch['conclusion'],ch['check_suite']['id']) == (j['id'],m['head'],'completed','success',w['check_suite_id']), 'check provenance')
+            ids.add(j['id'])
+    need(len(ids) == 23 and len(run_ids) == 12, 'evidence totals')
+    final_candidate(m, fetch)
+    existing = attestation(m, fetch)
+    return {'decision':'already' if existing is not None else 'ready','candidate':m['head'],'workflows':12,'jobs':23,'check_id':existing,'release_authorized':False}
+
+def current_governance(env):
+    url = 'https://api.github.com/repos/' + GOV + '/branches/main'
+    req = Request(url, headers={'Accept':'application/vnd.github+json','User-Agent':'Registro-Docente-GOV-AUTO-01','X-GitHub-Api-Version':'2022-11-28'})
+    with build_opener(old.NoRedirect()).open(req, timeout=20) as f:
+        need(f.geturl() == url and f.status == 200, 'governance endpoint')
+        raw = f.read(2_000_001); need(len(raw) <= 2_000_000, 'governance response size')
+        b = json.loads(raw)
+    need(b['name'] == 'main' and b['protected'] is True and b['commit']['sha'] == env['GITHUB_SHA'], 'governance main changed')
+
+def payload(m, run):
+    return {'name':CHECK,'head_sha':m['head'],'status':'completed','conclusion':'success',
+            'external_id':'GOV-AUTO-01:'+POLICY+':'+m['head']+':'+run,
+            'details_url':'https://github.com/'+GOV+'/actions/runs/'+run,
+            'output':OUTPUT.copy()}
+
+def bound_transport(base, m, run):
+    expected = payload(manifest(m),run)
+    class BoundTransport(base):
+        def post(self, body):
+            need(body == expected, 'exact payload')
+            return self._request('POST','/repos/'+old.REPO+'/check-runs',body)
+    return BoundTransport
+
+def execute_live(env, m, credential, auth, issue, factory, revoke, governance, permissions):
+    run = context(env); m = manifest(m); governance(env)
+    proof = auth(credential)
+    need(proof == {'state':'AUTH_SCOPE_PASS','app_id':APP,'installation_id':INSTALLATION,'repository_count':1,'token_revoked':True,'check_published':False,'release_authorized':False}, 'authentication proof')
+    try: response = issue(credential)
+    except Exception: raise Hold('WRITE_TOKEN_ISSUANCE_UNCERTAIN; no retry') from None
+    token = response.get('token') if isinstance(response,dict) else None
+    need(isinstance(token,str) and token and not any(c.isspace() for c in token), 'WRITE_TOKEN_UNAVAILABLE; reconcile issuance')
+    state = 'NO_CHECK_ATTEMPT'
+    try:
+        need(response.get('permissions') == permissions, 'write token permissions')
+        t = factory(token)
+        scope = t.scope()
+        need(scope['total_count'] == len(scope['repositories']) == 1 and (scope['repositories'][0]['id'],scope['repositories'][0]['full_name']) == (old.RID,old.REPO), 'write token scope')
+        result = plan(m, t.fetch)
+        if result['decision'] == 'already':
+            state = 'ALREADY_ATTESTED'; result = dict(result, state=state)
+        else:
+            need(attestation(m,t.fetch) is None, 'attestation changed; reconcile')
+            final_candidate(m,t.fetch); governance(env)
+            body = payload(m,run); state = 'CHECK_ATTEMPT_UNCERTAIN'
+            reply = t.post(body)
+            need((reply['name'],reply['head_sha'],reply['status'],reply['conclusion'],reply['app']['id'],reply['external_id'],reply['details_url']) == (CHECK,m['head'],'completed','success',APP,body['external_id'],body['details_url']) and number(reply['id']), 'post response identity')
+            state = 'CHECK_EMITTED'
+            need(attestation(m,t.fetch) == reply['id'], 'published attestation readback')
+            result = {'state':state,'candidate':m['head'],'check_id':reply['id'],'release_authorized':False}
+    finally:
+        try: revoke(token)
+        except Exception: raise Hold(state+'; WRITE_TOKEN_REVOCATION_UNATTESTED; reconcile, no retry') from None
+    return dict(result, token_revoked=True)
+
+def load_manifest():
+    def unique(pairs):
+        out = {}
+        for k,v in pairs:
+            need(k not in out, 'duplicate manifest key'); out[k] = v
+        return out
+    p = ROOT/'candidate.json'
+    need(p.is_file() and not p.is_symlink() and p.stat().st_size <= 4096, 'manifest file')
+    return manifest(json.loads(p.read_text(encoding='utf-8'),object_pairs_hook=unique))
+
+def main():
+    try:
+        run = context(os.environ); m = load_manifest(); current_governance(os.environ)
+        need(len(sys.argv)==2 and sys.argv[1] in ('plan','live'), 'mode')
+        if sys.argv[1] == 'plan':
+            result = plan(m,old.get)
+            with open(os.environ['GITHUB_OUTPUT'],'a',encoding='utf-8') as f: f.write('decision='+result['decision']+'\n')
+        else:
+            # Imported only in the environment-protected live job.
+            import auth_probe as a
+            import integration as i
+            import emitter as e
+            BoundTransport = bound_transport(e.InstallationTransport,m,run)
+            key = os.environ.pop('GOV_APP_PRIVATE_KEY',''); credential = a.jwt(key); del key
+            req = a.Transport().request
+            result = execute_live(os.environ,m,credential,lambda c:a.probe(c,req),i.issue,BoundTransport,lambda token:req('DELETE','/installation/token',token),current_governance,i.WRITE_PERMS)
+        print(json.dumps(result,sort_keys=True))
+        with open(os.environ['GITHUB_STEP_SUMMARY'],'a',encoding='utf-8') as f:
+            f.write('```json\n'+json.dumps(result,sort_keys=True,indent=2)+'\n```\n')
+    except Exception as exc:
+        print('HOLD: '+(str(exc) if isinstance(exc,Hold) else type(exc).__name__)+'; inspect evidence before retry')
+        raise SystemExit(1)
+
+if __name__ == '__main__': main()

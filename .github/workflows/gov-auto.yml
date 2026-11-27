@@ -1,0 +1,94 @@
+name: GOV-AUTO-01 — admission from protected candidate manifest
+on:
+  push:
+    branches: [main]
+    paths: [admission/candidate.json]
+permissions: {}
+concurrency:
+  group: gov-admission-07
+  cancel-in-progress: false
+jobs:
+  qualification:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    outputs:
+      decision: ${{ steps.plan.outputs.decision }}
+    steps:
+      - &prepare
+        name: Prepare reviewed governance source at exact protected SHA (no candidate checkout)
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = antoniocorsano-boop/registro-docente-governance
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_REF_PROTECTED" = true
+          test "$GITHUB_EVENT_NAME" = push
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$GITHUB_ACTOR_ID" = 233439245
+          test "$GITHUB_TRIGGERING_ACTOR" = antoniocorsano-boop
+          test "$GITHUB_WORKFLOW_REF" = antoniocorsano-boop/registro-docente-governance/.github/workflows/gov-auto.yml@refs/heads/main
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$GITHUB_WORKFLOW_SHA" = "$GITHUB_SHA"
+          [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]
+          umask 077
+          export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0
+          mkdir "$RUNNER_TEMP/gov-auto"
+          cd "$RUNNER_TEMP/gov-auto"
+          git init -q
+          git -c credential.helper= -c core.hooksPath=/dev/null fetch --no-tags --depth=1 https://github.com/antoniocorsano-boop/registro-docente-governance.git "$GITHUB_SHA"
+          git -c core.hooksPath=/dev/null checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          cd admission/qualified
+          sha256sum -c SHA256SUMS
+      - name: Run inherited and automation synthetic regressions (no secrets)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/gov-auto/admission/qualified"
+          python3 -m unittest -v test_remote test_emitter test_auth_probe test_integration.IntegrationTests
+          cd ..
+          python3 -m unittest -v test_gov_auto
+      - name: Discover and verify exact candidate evidence (read only)
+        id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/gov-auto/admission"
+          python3 gov_auto.py plan
+  emit:
+    needs: qualification
+    if: github.repository == 'antoniocorsano-boop/registro-docente-governance' && github.ref == 'refs/heads/main' && github.ref_protected && github.event_name == 'push' && github.run_attempt == 1 && github.actor_id == '233439245' && github.triggering_actor == 'antoniocorsano-boop' && needs.qualification.outputs.decision == 'ready'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: GOV-ADMISSION
+    steps:
+      - *prepare
+      - name: Reverify and emit only after protected environment approval
+        shell: bash
+        env:
+          GOV_APP_PRIVATE_KEY: ${{ secrets.GOV_APP_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/gov-auto/admission"
+          python3 gov_auto.py live
+  outcome:
+    needs: [qualification, emit]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Require actual completion and report admission evidence (no release)
+        shell: bash
+        env:
+          QUALIFICATION_RESULT: ${{ needs.qualification.result }}
+          DECISION: ${{ needs.qualification.outputs.decision }}
+          EMISSION_RESULT: ${{ needs.emit.result }}
+        run: |
+          set -euo pipefail
+          test "$QUALIFICATION_RESULT" = success
+          case "$DECISION:$EMISSION_RESULT" in
+            already:skipped) echo 'ALREADY_ATTESTED — no credential used, no duplicate' ;;
+            ready:success) echo 'APPROVED_ADMISSION_PASS — evidence only' ;;
+            *) echo 'HOLD: mandatory outcome inconsistent' >&2; exit 1 ;;
+          esac
+          printf '%s\n' 'GOV-AUTO-01 completed. No merge or release authorized.' >> "$GITHUB_STEP_SUMMARY"

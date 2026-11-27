@@ -81,17 +81,41 @@ jobs:
               require(re.fullmatch(r'[1-9][0-9]{0,19}',env.get('GITHUB_RUN_ID','')) is not None,'run identity')
           
           def b64(data): return base64.urlsafe_b64encode(data).rstrip(b'=')
-          def jwt(key, now=None):
+          def normalize_key(key):
               require(isinstance(key,str) and 0<len(key)<32768,'key unavailable')
+              # Normalize only harmless transport whitespace; never reconstruct missing data.
+              key=key.strip(' \t\r\n')
+              if key.startswith('\ufeff'): key=key[1:].strip(' \t\r\n')
+              key=key.replace('\r\n','\n')
+              key='\n'.join(line.strip(' \t') for line in key.split('\n'))
+              if '\\n' in key or '\\r' in key: raise Hold('PEM literal newline escapes')
+              import re
+              match=re.fullmatch(r'-----BEGIN (RSA PRIVATE KEY|PRIVATE KEY)-----\n([A-Za-z0-9+/=\n]+)\n-----END \1-----',key)
+              require(match is not None,'PEM envelope or line structure')
+              try:
+                  body=match.group(2).replace('\n','')
+                  require(bool(base64.b64decode(body,validate=True)),'PEM body empty')
+              except (ValueError,TypeError): raise Hold('PEM body invalid') from None
+              return (key+'\n').encode('ascii')
+          
+          def jwt(key, now=None):
+              key=normalize_key(key)
               now=int(time.time() if now is None else now)
               message=b64(b'{"alg":"RS256","typ":"JWT"}')+b'.'+b64(json.dumps({'iat':now-60,'exp':now+480,'iss':str(APP)},separators=(',',':')).encode())
+              # Validate decoding and RSA integrity with no named files or diagnostic output.
+              opts=dict(stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,env={'PATH':'/usr/bin:/bin'},timeout=10,check=False)
+              parsed=subprocess.run(['/usr/bin/openssl','pkey','-inform','PEM','-noout','-passin','pass:'],input=key,**opts)
+              require(parsed.returncode==0,'PEM private key decode failed')
+              checked=subprocess.run(['/usr/bin/openssl','rsa','-inform','PEM','-check','-noout','-passin','pass:'],input=key,**opts)
+              require(checked.returncode==0 and b'RSA key ok' in checked.stdout,'RSA private key validation failed')
               # Linux runner: key lives in anonymous memory-backed FD, never a named file.
               fd=os.memfd_create('gov-auth-key',os.MFD_CLOEXEC)
               try:
-                  with os.fdopen(os.dup(fd),'wb') as stream: stream.write(key.encode())
+                  with os.fdopen(os.dup(fd),'wb') as stream: stream.write(key)
                   os.lseek(fd,0,os.SEEK_SET)
-                  p=subprocess.run(['/usr/bin/openssl','dgst','-sha256','-sign',f'/proc/self/fd/{fd}','-passin','pass:'],input=message,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,pass_fds=(fd,),env={'PATH':'/usr/bin:/bin'},timeout=10,check=False)
-                  require(p.returncode==0 and len(p.stdout)>=256,'signature failed')
+                  p=subprocess.run(['/usr/bin/openssl','dgst','-sha256','-sign',f'/proc/self/fd/{fd}','-passin','pass:','-sigopt','rsa_padding_mode:pkcs1'],input=message,pass_fds=(fd,),**opts)
+                  require(p.returncode==0,'RSA signing process failed')
+                  require(len(p.stdout)>=256,'RSA signature below 2048 bits')
                   return (message+b'.'+b64(p.stdout)).decode('ascii')
               finally: os.close(fd)
           
@@ -214,11 +238,31 @@ jobs:
                       self.assertEqual(result.returncode,0)
                   with self.assertRaises(a.Hold): a.jwt('invalid')
           
+              def test_pem_transport_and_diagnostics(self):
+                  def openssl(*args,data=None):
+                      return subprocess.check_output(['/usr/bin/openssl',*args],input=data,stderr=subprocess.DEVNULL)
+                  key=openssl('genpkey','-algorithm','RSA','-pkeyopt','rsa_keygen_bits:2048')
+                  pem=openssl('pkey','-traditional',data=key).decode()
+                  variants=[key.decode(),pem,pem.replace('\n','\r\n'),pem.rstrip('\n'),'  '+pem+'  ','\ufeff'+pem,pem.replace('\n','\n ',1)]
+                  expected=a.jwt(pem,now=1000)
+                  for variant in variants:
+                      with self.subTest(case='transport'):
+                          self.assertEqual(a.jwt(variant,now=1000),expected)
+                  ec=openssl('genpkey','-algorithm','EC','-pkeyopt','ec_paramgen_curve:P-256').decode()
+                  small=openssl('genpkey','-algorithm','RSA','-pkeyopt','rsa_keygen_bits:1024').decode()
+                  enc=openssl('pkcs8','-topk8','-passout','pass:synthetic',data=key).decode()
+                  pss=openssl('genpkey','-algorithm','RSA-PSS','-pkeyopt','rsa_keygen_bits:2048').decode()
+                  cases=[('', 'key unavailable'),(pem.replace('\n','\\n'),'PEM literal newline escapes'),(' '.join(pem.splitlines()),'PEM envelope or line structure'),('\n'.join(pem.splitlines()[:2]+pem.splitlines()[3:])+'\n','PEM private key decode failed'),('\n'.join(pem.splitlines()[:-1]),'PEM envelope or line structure'),(ec,'RSA private key validation failed'),(small,'RSA signature below 2048 bits'),(enc,'PEM envelope or line structure'),(pem.replace('-','–'),'PEM envelope or line structure'),(pss,'RSA signing process failed'),('-----BEGIN PRIVATE KEY-----\nA\n-----END PRIVATE KEY-----','PEM body invalid')]
+                  for variant,label in cases:
+                      with self.subTest(expected=label):
+                          with self.assertRaises(a.Hold) as ctx: a.jwt(variant,now=1000)
+                          self.assertEqual(str(ctx.exception),label)
+          
           if __name__=='__main__': unittest.main(verbosity=2)
           GOV05_END_1
           cat > SHA256SUMS <<'GOV05_END_2'
-          75098866cf79559bd46dfc36cd139c954698c6e9549455732b6abebeed5e8c36  auth_probe.py
-          f4875a62cd7c45b7706dda55da69d42d80559f9e4bb5254818def0d252160515  test_auth_probe.py
+          98f98fbad6e3061b959d6d34edf302b2df62420f18a8d93bf31e5388e3368572  auth_probe.py
+          5b558cb32b9f821341ee9a89739efee2927bd7e1b77d77f0cee19407f284b432  test_auth_probe.py
           GOV05_END_2
           sha256sum -c SHA256SUMS
       - name: Run synthetic regressions (no secrets)

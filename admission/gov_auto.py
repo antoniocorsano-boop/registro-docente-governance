@@ -7,6 +7,7 @@ import re
 import sys
 from pathlib import Path
 from urllib.request import Request, build_opener
+from urllib.error import HTTPError
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / 'qualified'))
@@ -141,14 +142,70 @@ def plan(m, fetch):
     existing = attestation(m, fetch)
     return {'decision':'already' if existing is not None else 'ready','candidate':m['head'],'workflows':12,'jobs':23,'check_id':existing,'release_authorized':False}
 
+class ReadHTTP(Hold):
+    """Fixed labels and bounded numeric headers only; never log URLs or bodies."""
+    def __init__(self, phase, exc):
+        def numeric(name):
+            value = exc.headers.get(name, '') if exc.headers else ''
+            return value if re.fullmatch(r'[0-9]{1,12}', value) else 'unknown'
+        self.status = exc.code
+        self.phase = phase
+        self.remaining = numeric('X-RateLimit-Remaining')
+        super().__init__(f'{phase} HTTP {self.status}; remaining={self.remaining}; retry_after={numeric("Retry-After")}')
+
+
+def read_json(repo, path, phase, token=None, opener=None):
+    need(repo in (GOV,old.REPO), 'read repository')
+    if repo == GOV:
+        need(path == 'branches/main' and phase == 'governance', 'governance read route')
+    else:
+        need(phase == 'candidate' and re.fullmatch(r'(?:pulls/[1-9][0-9]{0,19}|branches/main|git/commits/[0-9a-f]{40}|git/trees/[0-9a-f]{40}\?recursive=1|actions/runs\?head_sha=[0-9a-f]{40}&event=pull_request&per_page=100|actions/runs/[1-9][0-9]{0,19}(?:/jobs\?per_page=100)?|commits/[0-9a-f]{40}/check-runs\?per_page=100&filter=(?:latest|all))',path), 'candidate read route')
+    url = 'https://api.github.com/repos/' + repo + '/' + path
+    headers = {'Accept':'application/vnd.github+json','User-Agent':'Registro-Docente-GOV-AUTO-01','X-GitHub-Api-Version':'2022-11-28'}
+    if token is not None:
+        need(isinstance(token,str) and token and not any(c.isspace() for c in token), 'read credential')
+        headers['Authorization'] = 'Bearer ' + token
+    try:
+        with (opener or build_opener(old.NoRedirect())).open(Request(url,headers=headers,method='GET'),timeout=20) as f:
+            need(f.geturl() == url and f.status == 200, 'read endpoint/status')
+            raw = f.read(20_000_001); need(len(raw) <= 20_000_000, 'read response size')
+            return json.loads(raw)
+    except HTTPError as exc:
+        # Do not log arbitrary paths, header text, or response bodies.
+        label = phase if repo == GOV else 'candidate/' + path.split('/')[0].split('?')[0]
+        raise ReadHTTP(label,exc) from None
+
+
 def current_governance(env):
-    url = 'https://api.github.com/repos/' + GOV + '/branches/main'
-    req = Request(url, headers={'Accept':'application/vnd.github+json','User-Agent':'Registro-Docente-GOV-AUTO-01','X-GitHub-Api-Version':'2022-11-28'})
-    with build_opener(old.NoRedirect()).open(req, timeout=20) as f:
-        need(f.geturl() == url and f.status == 200, 'governance endpoint')
-        raw = f.read(2_000_001); need(len(raw) <= 2_000_000, 'governance response size')
-        b = json.loads(raw)
+    b = read_json(GOV,'branches/main','governance',env.get('GOV_READ_TOKEN',''))
     need(b['name'] == 'main' and b['protected'] is True and b['commit']['sha'] == env['GITHUB_SHA'], 'governance main changed')
+
+
+def public_plan(m, fetch):
+    try: return plan(m,fetch)
+    except ReadHTTP as exc:
+        # Switch only to the existing, separately approved authenticated route.
+        # No retry of the public request, and no fallback on evidence mismatch.
+        if exc.status not in (401,403,429): raise
+        return {'decision':'protected_read','candidate':m['head'],'diagnostic':str(exc),'release_authorized':False}
+
+
+def protected_plan(m, credential, probe, request, fetch_factory):
+    """Reuse the qualified read-only identity/scope probe and its finally-revoke."""
+    result = None
+    def observed(method,path,token,body=None):
+        nonlocal result
+        data = request(method,path,token,body)
+        if method == 'GET' and path == '/installation/repositories?per_page=100':
+            need(result is None, 'duplicate read scope')
+            need(data['total_count'] == len(data['repositories']) == 1 and (data['repositories'][0]['id'],data['repositories'][0]['full_name']) == (old.RID,old.REPO), 'read token scope')
+            result = plan(m,fetch_factory(token))
+        return data
+    proof = probe(credential,observed)
+    need(proof == {'state':'AUTH_SCOPE_PASS','app_id':APP,'installation_id':INSTALLATION,'repository_count':1,'token_revoked':True,'check_published':False,'release_authorized':False}, 'protected read proof')
+    need(result is not None, 'protected read result missing')
+    return dict(result,token_revoked=True)
+
 
 def payload(m, run):
     return {'name':CHECK,'head_sha':m['head'],'status':'completed','conclusion':'success',
@@ -210,7 +267,7 @@ def main():
         run = context(os.environ); m = load_manifest(); current_governance(os.environ)
         need(len(sys.argv)==2 and sys.argv[1] in ('plan','live'), 'mode')
         if sys.argv[1] == 'plan':
-            result = plan(m,old.get)
+            result = public_plan(m,lambda path:read_json(old.REPO,path,'candidate'))
             with open(os.environ['GITHUB_OUTPUT'],'a',encoding='utf-8') as f: f.write('decision='+result['decision']+'\n')
         else:
             # Imported only in the environment-protected live job.
@@ -220,7 +277,13 @@ def main():
             BoundTransport = bound_transport(e.InstallationTransport,m,run)
             key = os.environ.pop('GOV_APP_PRIVATE_KEY',''); credential = a.jwt(key); del key
             req = a.Transport().request
-            result = execute_live(os.environ,m,credential,lambda c:a.probe(c,req),i.issue,BoundTransport,lambda token:req('DELETE','/installation/token',token),current_governance,i.WRITE_PERMS)
+            decision = os.environ.get('GOV_PLAN_DECISION')
+            need(decision in ('ready','protected_read'), 'approved decision')
+            result = protected_plan(m,credential,a.probe,req,lambda token:lambda path:read_json(old.REPO,path,'candidate',token)) if decision == 'protected_read' else None
+            if result is not None and result['decision'] == 'already':
+                result = dict(result,state='ALREADY_ATTESTED')
+            else:
+                result = execute_live(os.environ,m,credential,lambda c:a.probe(c,req),i.issue,BoundTransport,lambda token:req('DELETE','/installation/token',token),current_governance,i.WRITE_PERMS)
         print(json.dumps(result,sort_keys=True))
         with open(os.environ['GITHUB_STEP_SUMMARY'],'a',encoding='utf-8') as f:
             f.write('```json\n'+json.dumps(result,sort_keys=True,indent=2)+'\n```\n')

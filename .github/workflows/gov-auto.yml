@@ -2,13 +2,15 @@ name: GOV-AUTO-01 — admission from protected candidate manifest
 on:
   push:
     branches: [main]
-    paths: [admission/candidate.json]
+    paths: [admission/candidate.json, admission/gov_auto.py, admission/test_http.py, .github/workflows/gov-auto.yml]
 permissions: {}
 concurrency:
   group: gov-admission-07
   cancel-in-progress: false
 jobs:
   qualification:
+    permissions:
+      contents: read
     runs-on: ubuntu-24.04
     timeout-minutes: 8
     outputs:
@@ -47,9 +49,11 @@ jobs:
           cd "$RUNNER_TEMP/gov-auto/admission/qualified"
           python3 -m unittest -v test_remote test_emitter test_auth_probe test_integration.IntegrationTests
           cd ..
-          python3 -m unittest -v test_gov_auto
+          python3 -m unittest -v test_gov_auto test_http
       - name: Discover and verify exact candidate evidence (read only)
         id: plan
+        env:
+          GOV_READ_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
@@ -57,9 +61,11 @@ jobs:
           python3 gov_auto.py plan
   emit:
     needs: qualification
-    if: github.repository == 'antoniocorsano-boop/registro-docente-governance' && github.ref == 'refs/heads/main' && github.ref_protected && github.event_name == 'push' && github.run_attempt == 1 && github.actor_id == '233439245' && github.triggering_actor == 'antoniocorsano-boop' && needs.qualification.outputs.decision == 'ready'
+    if: github.repository == 'antoniocorsano-boop/registro-docente-governance' && github.ref == 'refs/heads/main' && github.ref_protected && github.event_name == 'push' && github.run_attempt == 1 && github.actor_id == '233439245' && github.triggering_actor == 'antoniocorsano-boop' && (needs.qualification.outputs.decision == 'ready' || needs.qualification.outputs.decision == 'protected_read')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    permissions:
+      contents: read
     environment: GOV-ADMISSION
     steps:
       - *prepare
@@ -67,6 +73,8 @@ jobs:
         shell: bash
         env:
           GOV_APP_PRIVATE_KEY: ${{ secrets.GOV_APP_PRIVATE_KEY }}
+          GOV_READ_TOKEN: ${{ github.token }}
+          GOV_PLAN_DECISION: ${{ needs.qualification.outputs.decision }}
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP/gov-auto/admission"
@@ -88,7 +96,7 @@ jobs:
           test "$QUALIFICATION_RESULT" = success
           case "$DECISION:$EMISSION_RESULT" in
             already:skipped) echo 'ALREADY_ATTESTED — no credential used, no duplicate' ;;
-            ready:success) echo 'APPROVED_ADMISSION_PASS — evidence only' ;;
+            ready:success|protected_read:success) echo 'APPROVED_ADMISSION_PASS — evidence only' ;;
             *) echo 'HOLD: mandatory outcome inconsistent' >&2; exit 1 ;;
           esac
           printf '%s\n' 'GOV-AUTO-01 completed. No merge or release authorized.' >> "$GITHUB_STEP_SUMMARY"

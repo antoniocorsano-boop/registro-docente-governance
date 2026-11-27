@@ -1,0 +1,228 @@
+name: GOV-ADMISSION-03 — verifica indipendente in sola lettura
+on:
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: gov-admission-read-only
+  cancel-in-progress: false
+jobs:
+  evidence:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Verify environment, unpack trusted verifier, run synthetic regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = antoniocorsano-boop/registro-docente-governance
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          umask 077
+          mkdir "$RUNNER_TEMP/gov-admission-02"
+          cd "$RUNNER_TEMP/gov-admission-02"
+          cat > verify-exact-candidate.sh <<'GOV_END_verify_exact_candidate_sh'
+          #!/usr/bin/env bash
+          # Run from a trusted location outside the candidate checkout.
+          # Both arguments are supplied by the independent operator, not by PR code.
+          # Usage: bash /trusted/verify-exact-candidate.sh /path/to/checkout <event-head-sha>
+          set -euo pipefail
+          [[ $# == 2 ]] || { echo 'DENY: expected checkout and event head' >&2; exit 1; }
+          checkout=$1
+          observed=$2
+          # Independent immutable allowlist for the specific qualified candidate.
+          expected=1b83f6364985b89cdbd89b73e6c382bd6300f655
+          parent=b142cc03a8d6b90ee93ec93045e7455ce34639d8
+          [[ "$observed" == "$expected" ]] || { echo 'DENY: event SHA not approved' >&2; exit 1; }
+          # Do not allow local replace objects or injected repository/config variables.
+          unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CONFIG GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_NAMESPACE GIT_REPLACE_REF_BASE
+          export GIT_NO_REPLACE_OBJECTS=1
+          actual=$(git -C "$checkout" rev-parse --verify HEAD)
+          [[ "$actual" == "$expected" ]] || { echo 'DENY: checkout SHA not approved' >&2; exit 1; }
+          [[ "$(git -C "$checkout" rev-list --parents -n 1 "$actual")" == "$expected $parent" ]] || { echo 'DENY: unexpected parent' >&2; exit 1; }
+          expected_entries=$(cat <<'ENTRIES'
+          100644 blob d0205c714ef623348cf398c411f81d0f5c387461	.github/workflows/behavior-integrity-qualification.yml
+          100644 blob 8443ac7dcd15e2703812051cfe34bcbcf4e74ce6	.github/workflows/mobile-density-02-qualification.yml
+          100644 blob eb366d463f3ab62bf1ad81c80820ab6680d5e1a0	.github/workflows/nav-context-01-isolated-qualification.yml
+          100644 blob 922e4321f154ec76a52153d7a1d9d7c9e5716fc2	scripts/diagnostics/android-r3-admission.sh
+          ENTRIES
+          )
+          actual_entries=$(git -C "$checkout" ls-tree "$actual" -- .github/workflows/behavior-integrity-qualification.yml .github/workflows/mobile-density-02-qualification.yml .github/workflows/nav-context-01-isolated-qualification.yml scripts/diagnostics/android-r3-admission.sh)
+          [[ "$actual_entries" == "$expected_entries" ]] || { echo 'DENY: unapproved tree entries' >&2; exit 1; }
+          # Object attestation only: do not execute or trust candidate scripts.
+          printf 'PASS: externally pinned commit %s (object identity only)\n' "$actual"
+          GOV_END_verify_exact_candidate_sh
+          cat > test_external_gate.py <<'GOV_END_test_external_gate_py'
+          import os, pathlib, subprocess, tempfile
+          source=pathlib.Path(__file__).with_name('verify-exact-candidate.sh').read_text()
+          paths=['.github/workflows/behavior-integrity-qualification.yml','.github/workflows/mobile-density-02-qualification.yml','.github/workflows/nav-context-01-isolated-qualification.yml','scripts/diagnostics/android-r3-admission.sh']
+          original_blobs=['d0205c714ef623348cf398c411f81d0f5c387461','8443ac7dcd15e2703812051cfe34bcbcf4e74ce6','eb366d463f3ab62bf1ad81c80820ab6680d5e1a0','922e4321f154ec76a52153d7a1d9d7c9e5716fc2']
+          with tempfile.TemporaryDirectory() as td:
+              root=pathlib.Path(td); repo=root/'repo'; repo.mkdir()
+              def git(*args): return subprocess.check_output(['git','-C',str(repo),*args],stderr=subprocess.STDOUT,text=True).strip()
+              git('init','-q'); git('config','user.name','Synthetic'); git('config','user.email','synthetic@example.invalid'); git('config','core.filemode','true')
+              for i,p in enumerate(paths):
+                  f=repo/p; f.parent.mkdir(parents=True,exist_ok=True); f.write_text(f'baseline {i}\n')
+              git('add','.'); git('commit','-qm','base'); parent=git('rev-parse','HEAD')
+              for i,p in enumerate(paths): (repo/p).write_text(f'approved {i}\n')
+              git('add','.'); git('commit','-qm','qualified'); approved=git('rev-parse','HEAD')
+              fixture=source.replace('1b83f6364985b89cdbd89b73e6c382bd6300f655',approved).replace('b142cc03a8d6b90ee93ec93045e7455ce34639d8',parent)
+              for p,b in zip(paths,original_blobs): fixture=fixture.replace(b,git('rev-parse',f'{approved}:{p}'))
+              guard=root/'trusted.sh'; guard.write_text(fixture)
+              def verify(label,event,want):
+                  result=subprocess.run(['bash',str(guard),str(repo),event],text=True,capture_output=True)
+                  assert (result.returncode==0)==want,(label,result.stdout,result.stderr)
+                  print(label, 'PASS', (result.stdout or result.stderr).strip())
+              verify('approved fixture',approved,True)
+              verify('wrong event SHA',parent,False)
+              git('checkout','-q',parent); verify('wrong checkout',approved,False)
+              # Each variation is a different object, rejected by the independent pin.
+              for label,change in [('script content',lambda: (repo/paths[3]).write_text('different\n')),('script mode',lambda: (repo/paths[3]).chmod(0o755)),('workflow content',lambda: (repo/paths[0]).write_text('different\n')),('extra file',lambda: (repo/'unexpected').write_text('different\n'))]:
+                  git('checkout','-q','--detach',approved); git('reset','--hard',approved); change(); git('add','.'); git('commit','-qm',label); alternate=git('rev-parse','HEAD'); verify(label,alternate,False); verify(label+' with approved event',approved,False)
+              git('checkout','-q','--detach',approved); git('commit','--allow-empty','-qm','extra'); verify('extra commit',git('rev-parse','HEAD'),False)
+              git('checkout','-q','--detach',approved); verify('approved remains accepted',approved,True)
+          GOV_END_test_external_gate_py
+          cat > verify_remote.py <<'GOV_END_verify_remote_py'
+          #!/usr/bin/env python3
+          """Read-only, fail-closed admission evidence check for the frozen PR #416.
+          Run from an independent trusted directory; never execute candidate contents.
+          """
+          import json
+          from urllib.request import Request, build_opener, HTTPRedirectHandler
+          from urllib.error import URLError
+          from urllib.parse import urlsplit
+
+          REPO='antoniocorsano-boop/registro-docente'
+          RID=1428043626
+          HEAD='1b83f6364985b89cdbd89b73e6c382bd6300f655'
+          BASE='1e9bcd0eb8bd5c7e72ea059b3f90f72805f9cdd1'
+          PARENT='b142cc03a8d6b90ee93ec93045e7455ce34639d8'
+          TREE='ccf173d4cdfedf44533b1d1d7db7bff70b034418'
+          BRANCH='candidate/cand-prod-01'
+          APP=15368
+          ENTRIES={
+          '.github/workflows/behavior-integrity-qualification.yml':'d0205c714ef623348cf398c411f81d0f5c387461',
+          '.github/workflows/mobile-density-02-qualification.yml':'8443ac7dcd15e2703812051cfe34bcbcf4e74ce6',
+          '.github/workflows/nav-context-01-isolated-qualification.yml':'eb366d463f3ab62bf1ad81c80820ab6680d5e1a0',
+          'scripts/diagnostics/android-r3-admission.sh':'922e4321f154ec76a52153d7a1d9d7c9e5716fc2'}
+          RUNS={
+          45937846094:(391941854,['predeploy-security-verify']),
+          45937846134:(408579107,['qualify-header-01']),
+          45937846327:(416379230,['behavior-integrity-synthetic-chromium']),
+          45937846169:(416154802,['mobile-density-02-synthetic-chromium']),
+          45937846185:(414966856,['android-probe']),
+          45937846137:(422912819,['preflight','native-evidence (32, v9)','native-evidence (32, legacy)','native-evidence (36, v9)','native-evidence (36, legacy)']),
+          45937846110:(418894829,['Synthetic Chromium Android 390 / 320','Typecheck / security / invariant contracts']),
+          45937846129:(394446897,['browser-qualification']),
+          45937846157:(427396129,['installed-professional-v7 (32)','installed-professional-v7 (36)','R4a startup-only API 32','hybrid-evidence / preflight','hybrid-evidence / pilot (32, 1)','hybrid-evidence / pilot (36, 1)']),
+          45937846091:(404859404,['flow03-contracts']),
+          45937846317:(419358552,['compatibility (rc2, 37c61d4c64993c986a3edcd2b421310adf20de92)','compatibility (rc3, b726f4a6dc0eb90a066113bee7cceabf29c629a5)']),
+          45937846431:(401768724,['qualify-invariants'])}
+          class Denied(Exception): pass
+          def require(ok, label):
+              if not ok: raise Denied(label)
+          class NoRedirect(HTTPRedirectHandler):
+              def redirect_request(self,*args,**kwargs): return None
+
+          def get(path):
+              req=Request('https://api.github.com/repos/'+REPO+'/'+path,headers={'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28','User-Agent':'Registro-Docente-Governance-ReadOnly'})
+              with build_opener(NoRedirect()).open(req, timeout=20) as f:
+                  require(urlsplit(f.geturl()).hostname=='api.github.com','unexpected endpoint')
+                  data=f.read(20_000_001)
+                  require(len(data)<=20_000_000,'response too large')
+                  return json.loads(data)
+
+          def check_pr(p):
+              require(p['number']==416 and p['state']=='open' and p['merged'] is False,'PR identity/state')
+              for key,ref,sha in [('head',BRANCH,HEAD),('base','main',BASE)]:
+                  v=p[key]; require(v['repo']['id']==RID and v['repo']['full_name']==REPO and v['ref']==ref and v['sha']==sha,'PR '+key)
+
+          def verify(fetch=get):
+              check_pr(fetch('pulls/416'))
+              b=fetch('branches/main'); require(b['name']=='main' and b['commit']['sha']==BASE and b['protected'] is True,'main identity/protection')
+              c=fetch('git/commits/'+HEAD)
+              require(c['sha']==HEAD and [x['sha'] for x in c['parents']]==[PARENT] and c['tree']['sha']==TREE,'commit parent/tree')
+              t=fetch('git/trees/'+TREE+'?recursive=1'); require(t['sha']==TREE and t['truncated'] is False,'complete tree')
+              for path,sha in ENTRIES.items():
+                  rows=[x for x in t['tree'] if x['path']==path]
+                  require(len(rows)==1 and (rows[0]['sha'],rows[0]['mode'],rows[0]['type'])==(sha,'100644','blob'),'tree entry '+path)
+              checks=fetch('commits/'+HEAD+'/check-runs?per_page=100&filter=latest'); require(checks['total_count']==len(checks['check_runs']) and len(checks['check_runs'])<100,'incomplete checks')
+              ids=set(); count=0
+              for run,(workflow,names) in RUNS.items():
+                  w=fetch('actions/runs/'+str(run))
+                  require((w['id'],w['workflow_id'],w['head_sha'],w['head_branch'],w['event'],w['run_attempt'],w['status'],w['conclusion'],w['repository']['id'],w['head_repository']['id'])==(run,workflow,HEAD,BRANCH,'pull_request',1,'completed','success',RID,RID),'workflow '+str(run))
+                  matches=[p for p in w['pull_requests'] if p['number']==416 and p['head']['sha']==HEAD and p['head']['ref']==BRANCH and p['head']['repo']['id']==RID and p['base']['sha']==BASE and p['base']['ref']=='main' and p['base']['repo']['id']==RID]
+                  require(len(matches)==1,'workflow PR '+str(run))
+                  j=fetch('actions/runs/'+str(run)+'/jobs?per_page=100')
+                  require(j['total_count']==len(j['jobs'])==len(names) and sorted(x['name'] for x in j['jobs'])==sorted(names),'job matrix '+str(run))
+                  for job in j['jobs']:
+                      require(job['id'] not in ids and (job['run_id'],job['head_sha'],job['status'],job['conclusion'])==(run,HEAD,'completed','success'),'job evidence '+job['name'])
+                      same=[x for x in checks['check_runs'] if x['name']==job['name'] and x['app']['id']==APP]
+                      require(len(same)==1,'ambiguous check '+job['name']); ch=same[0]
+                      require((ch['id'],ch['head_sha'],ch['status'],ch['conclusion'],ch['check_suite']['id'])==(job['id'],HEAD,'completed','success',w['check_suite_id']),'check provenance '+job['name'])
+                      ids.add(job['id']); count+=1
+              require(count==23,'job total')
+              check_pr(fetch('pulls/416'))
+              b=fetch('branches/main'); require(b['commit']['sha']==BASE and b['protected'] is True,'final base')
+              return {'state':'READ_ONLY_EVIDENCE_PASS','candidate':HEAD,'workflows':len(RUNS),'jobs':count,'published':False,'release_authorized':False}
+
+          if __name__=='__main__':
+              try: print(json.dumps(verify(),indent=2))
+              except (Denied,URLError,OSError,ValueError,TypeError,KeyError,IndexError) as e:
+                  print('HOLD: '+(str(e) if isinstance(e,Denied) else type(e).__name__))
+                  raise SystemExit(1)
+          GOV_END_verify_remote_py
+          cat > test_remote.py <<'GOV_END_test_remote_py'
+          import unittest, copy
+          import verify_remote as v
+
+          def fixture():
+              p={'number':416,'state':'open','merged':False,'head':{'sha':v.HEAD,'ref':v.BRANCH,'repo':{'id':v.RID,'full_name':v.REPO}},'base':{'sha':v.BASE,'ref':'main','repo':{'id':v.RID,'full_name':v.REPO}}}
+              data={'pulls/416':p,'branches/main':{'name':'main','commit':{'sha':v.BASE},'protected':True},'git/commits/'+v.HEAD:{'sha':v.HEAD,'parents':[{'sha':v.PARENT}],'tree':{'sha':v.TREE}},'git/trees/'+v.TREE+'?recursive=1':{'sha':v.TREE,'truncated':False,'tree':[{'path':k,'sha':s,'mode':'100644','type':'blob'} for k,s in v.ENTRIES.items()]}}
+              checks=[]
+              for run,(wid,names) in v.RUNS.items():
+                  data['actions/runs/'+str(run)]={'id':run,'workflow_id':wid,'head_sha':v.HEAD,'head_branch':v.BRANCH,'event':'pull_request','run_attempt':1,'status':'completed','conclusion':'success','repository':{'id':v.RID},'head_repository':{'id':v.RID},'check_suite_id':run+1,'pull_requests':[copy.deepcopy(p)]}
+                  jobs=[]
+                  for name in names:
+                      ident=len(checks)+1
+                      jobs.append({'id':ident,'name':name,'run_id':run,'head_sha':v.HEAD,'status':'completed','conclusion':'success'})
+                      checks.append({'id':ident,'name':name,'app':{'id':v.APP},'head_sha':v.HEAD,'status':'completed','conclusion':'success','check_suite':{'id':run+1}})
+                  data['actions/runs/'+str(run)+'/jobs?per_page=100']={'total_count':len(jobs),'jobs':jobs}
+              data['commits/'+v.HEAD+'/check-runs?per_page=100&filter=latest']={'total_count':len(checks),'check_runs':checks}
+              return data
+          class TestRemote(unittest.TestCase):
+              def test_valid(self): self.assertEqual(v.verify(fixture().__getitem__)['jobs'],23)
+              def test_fail_closed(self):
+                  c='git/commits/'+v.HEAD; t='git/trees/'+v.TREE+'?recursive=1'; w='actions/runs/45937846157'; j=w+'/jobs?per_page=100'; k='commits/'+v.HEAD+'/check-runs?per_page=100&filter=latest'
+                  variants=[('head',lambda d:d['pulls/416']['head'].update(sha='other')),('base',lambda d:d['pulls/416']['base'].update(sha='other')),('repo',lambda d:d['pulls/416']['head']['repo'].update(id=0)),('merged',lambda d:d['pulls/416'].update(merged=True)),('protection',lambda d:d['branches/main'].update(protected=False)),('parent',lambda d:d[c]['parents'].append({'sha':'other'})),('tree',lambda d:d[c]['tree'].update(sha='other')),('truncated',lambda d:d[t].update(truncated=True)),('script blob',lambda d:d[t]['tree'][-1].update(sha='other')),('script mode',lambda d:d[t]['tree'][-1].update(mode='100755')),('workflow attempt',lambda d:d[w].update(run_attempt=2)),('workflow event',lambda d:d[w].update(event='push')),('workflow identity',lambda d:d[w].update(workflow_id=0)),('missing PR',lambda d:d[w].update(pull_requests=[])),('skipped job',lambda d:d[j]['jobs'][0].update(conclusion='skipped')),('missing job',lambda d:d[j]['jobs'].pop()),('wrong job sha',lambda d:d[j]['jobs'][0].update(head_sha='other')),('wrong app',lambda d:d[k]['check_runs'][0]['app'].update(id=0)),('wrong suite',lambda d:d[k]['check_runs'][0]['check_suite'].update(id=0)),('duplicate check',lambda d:(d[k]['check_runs'].append(copy.deepcopy(d[k]['check_runs'][0])),d[k].update(total_count=24))),('incomplete page',lambda d:d[k].update(total_count=24))]
+                  for name,change in variants:
+                      with self.subTest(name=name):
+                          d=fixture(); change(d)
+                          with self.assertRaises(v.Denied): v.verify(d.__getitem__)
+              def test_race(self):
+                  d=fixture(); n=0
+                  def get(p):
+                      nonlocal n
+                      if p=='pulls/416':
+                          n+=1
+                          if n==2: d[p]['head']['sha']='other'
+                      return d[p]
+                  with self.assertRaises(v.Denied): v.verify(get)
+          if __name__=='__main__':unittest.main(verbosity=2)
+          GOV_END_test_remote_py
+          cat > SHA256SUMS <<'GOV_MANIFEST'
+          c97fb802a6409b397f0c073a265f0ce886e428df58674885cd37d62795e7dc61  verify-exact-candidate.sh
+          ffea9e8dc8f4c929421e6b8d17149f639cf0ad9827d2ee964383a7a5855f877a  test_external_gate.py
+          78341d2f05be9302401ac299905200baa7225b574b5b8d7d2f786dd7552600c1  verify_remote.py
+          6eae5faef1c1f8794f2cdc8437d3e34039fe96dd0717111e1abf0c38b36e2289  test_remote.py
+          GOV_MANIFEST
+          sha256sum -c SHA256SUMS
+          python3 test_external_gate.py
+          python3 test_remote.py
+      - name: Verify live public GitHub evidence (no publication)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/gov-admission-02"
+          sha256sum -c SHA256SUMS
+          python3 verify_remote.py

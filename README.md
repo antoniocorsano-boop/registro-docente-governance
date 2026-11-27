@@ -1,1 +1,9 @@
-# registro-docente-governance
+# GOV-ADMISSION-03 — ambiente separato, prima qualificazione
+
+Repository proposto: `antoniocorsano-boop/registro-docente-governance`, pubblico, `main`, senza dati scolastici o credenziali. Il runner GitHub-hosted standard Linux per repository pubblici è gratuito secondo la documentazione GitHub (https://docs.github.com/en/actions/concepts/billing-and-usage). Non attivare servizi aggiuntivi o runner a pagamento.
+
+La procedura è manuale (`workflow_dispatch`), senza accesso al candidato, checkout, azioni esterne, credenziali applicative o scritture API. L'unico file YAML incorpora byte per byte i quattro sorgenti del pacchetto GOV-ADMISSION-02, verificandoli con SHA-256 prima dei test e della lettura pubblica. Il `GITHUB_TOKEN` ha `permissions: {}`. Eseguire esclusivamente sul ramo `main` di questo repository, primo tentativo. Timeout 5 minuti. Se la rete o la quota API impediscono la verifica, HOLD; non ripetere indiscriminatamente.
+
+Dopo la creazione del repository pubblico con README e il trasferimento verificato del file `.github/workflows/gov-admission-read-only.yml`, aprire Actions, scegliere GOV-ADMISSION-03 e avviare Run workflow su main. Il successo atteso è READ_ONLY_EVIDENCE_PASS, non un'autorizzazione di integrazione. Le prove sintetiche non sostituiscono le prove dal runner reale. Nessuna attestazione pubblicata su Registro Docente; nessuna chiave generata o richiesta. P2 e R2 restano HOLD.
+
+Prima di qualunque futura emissione: escludere tutte le app/utenti non necessari con accesso in scrittura al repository di governance (in particolare app installate su tutti i repository presenti e futuri), verificare protezioni del ramo e deposito credenziali vincolato a esecuzioni fidate, qualificare separatamente il modulo di emissione e l'identità della GitHub App. Non utilizzare il repository applicativo per la custodia delle chiavi. Il nuovo controllo obbligatorio sarà attivato solo dopo qualificazione e prova negativa/positiva senza integrazione. Il presente YAML non implementa l'emissione.

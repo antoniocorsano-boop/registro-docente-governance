@@ -1,0 +1,394 @@
+name: GOV-ADMISSION-04 — qualificazione sintetica emittente
+on:
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: gov-admission-emitter-qualification
+  cancel-in-progress: false
+jobs:
+  qualification:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Verify context, source integrity and synthetic regressions (no publication)
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = antoniocorsano-boop/registro-docente-governance
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$GITHUB_WORKFLOW_REF" = antoniocorsano-boop/registro-docente-governance/.github/workflows/gov-admission-emitter-qualification.yml@refs/heads/main
+          umask 077
+          mkdir "$RUNNER_TEMP/gov-admission-04-qualification"
+          cd "$RUNNER_TEMP/gov-admission-04-qualification"
+          cat > verify_remote.py <<'GOV_END_04_0'
+          #!/usr/bin/env python3
+          """Read-only, fail-closed admission evidence check for the frozen PR #416.
+          Run from an independent trusted directory; never execute candidate contents.
+          """
+          import json
+          from urllib.request import Request, build_opener, HTTPRedirectHandler
+          from urllib.error import URLError
+          from urllib.parse import urlsplit
+
+          REPO='antoniocorsano-boop/registro-docente'
+          RID=1428043626
+          HEAD='1b83f6364985b89cdbd89b73e6c382bd6300f655'
+          BASE='1e9bcd0eb8bd5c7e72ea059b3f90f72805f9cdd1'
+          PARENT='b142cc03a8d6b90ee93ec93045e7455ce34639d8'
+          TREE='ccf173d4cdfedf44533b1d1d7db7bff70b034418'
+          BRANCH='candidate/cand-prod-01'
+          APP=15368
+          ENTRIES={
+          '.github/workflows/behavior-integrity-qualification.yml':'d0205c714ef623348cf398c411f81d0f5c387461',
+          '.github/workflows/mobile-density-02-qualification.yml':'8443ac7dcd15e2703812051cfe34bcbcf4e74ce6',
+          '.github/workflows/nav-context-01-isolated-qualification.yml':'eb366d463f3ab62bf1ad81c80820ab6680d5e1a0',
+          'scripts/diagnostics/android-r3-admission.sh':'922e4321f154ec76a52153d7a1d9d7c9e5716fc2'}
+          RUNS={
+          45937846094:(391941854,['predeploy-security-verify']),
+          45937846134:(408579107,['qualify-header-01']),
+          45937846327:(416379230,['behavior-integrity-synthetic-chromium']),
+          45937846169:(416154802,['mobile-density-02-synthetic-chromium']),
+          45937846185:(414966856,['android-probe']),
+          45937846137:(422912819,['preflight','native-evidence (32, v9)','native-evidence (32, legacy)','native-evidence (36, v9)','native-evidence (36, legacy)']),
+          45937846110:(418894829,['Synthetic Chromium Android 390 / 320','Typecheck / security / invariant contracts']),
+          45937846129:(394446897,['browser-qualification']),
+          45937846157:(427396129,['installed-professional-v7 (32)','installed-professional-v7 (36)','R4a startup-only API 32','hybrid-evidence / preflight','hybrid-evidence / pilot (32, 1)','hybrid-evidence / pilot (36, 1)']),
+          45937846091:(404859404,['flow03-contracts']),
+          45937846317:(419358552,['compatibility (rc2, 37c61d4c64993c986a3edcd2b421310adf20de92)','compatibility (rc3, b726f4a6dc0eb90a066113bee7cceabf29c629a5)']),
+          45937846431:(401768724,['qualify-invariants'])}
+          class Denied(Exception): pass
+          def require(ok, label):
+              if not ok: raise Denied(label)
+          class NoRedirect(HTTPRedirectHandler):
+              def redirect_request(self,*args,**kwargs): return None
+
+          def get(path):
+              req=Request('https://api.github.com/repos/'+REPO+'/'+path,headers={'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28','User-Agent':'Registro-Docente-Governance-ReadOnly'})
+              with build_opener(NoRedirect()).open(req, timeout=20) as f:
+                  require(urlsplit(f.geturl()).hostname=='api.github.com','unexpected endpoint')
+                  data=f.read(20_000_001)
+                  require(len(data)<=20_000_000,'response too large')
+                  return json.loads(data)
+
+          def check_pr(p):
+              require(p['number']==416 and p['state']=='open' and p['merged'] is False,'PR identity/state')
+              for key,ref,sha in [('head',BRANCH,HEAD),('base','main',BASE)]:
+                  v=p[key]; require(v['repo']['id']==RID and v['repo']['full_name']==REPO and v['ref']==ref and v['sha']==sha,'PR '+key)
+
+          def verify(fetch=get):
+              check_pr(fetch('pulls/416'))
+              b=fetch('branches/main'); require(b['name']=='main' and b['commit']['sha']==BASE and b['protected'] is True,'main identity/protection')
+              c=fetch('git/commits/'+HEAD)
+              require(c['sha']==HEAD and [x['sha'] for x in c['parents']]==[PARENT] and c['tree']['sha']==TREE,'commit parent/tree')
+              t=fetch('git/trees/'+TREE+'?recursive=1'); require(t['sha']==TREE and t['truncated'] is False,'complete tree')
+              for path,sha in ENTRIES.items():
+                  rows=[x for x in t['tree'] if x['path']==path]
+                  require(len(rows)==1 and (rows[0]['sha'],rows[0]['mode'],rows[0]['type'])==(sha,'100644','blob'),'tree entry '+path)
+              checks=fetch('commits/'+HEAD+'/check-runs?per_page=100&filter=latest'); require(checks['total_count']==len(checks['check_runs']) and len(checks['check_runs'])<100,'incomplete checks')
+              ids=set(); count=0
+              for run,(workflow,names) in RUNS.items():
+                  w=fetch('actions/runs/'+str(run))
+                  require((w['id'],w['workflow_id'],w['head_sha'],w['head_branch'],w['event'],w['run_attempt'],w['status'],w['conclusion'],w['repository']['id'],w['head_repository']['id'])==(run,workflow,HEAD,BRANCH,'pull_request',1,'completed','success',RID,RID),'workflow '+str(run))
+                  matches=[p for p in w['pull_requests'] if p['number']==416 and p['head']['sha']==HEAD and p['head']['ref']==BRANCH and p['head']['repo']['id']==RID and p['base']['sha']==BASE and p['base']['ref']=='main' and p['base']['repo']['id']==RID]
+                  require(len(matches)==1,'workflow PR '+str(run))
+                  j=fetch('actions/runs/'+str(run)+'/jobs?per_page=100')
+                  require(j['total_count']==len(j['jobs'])==len(names) and sorted(x['name'] for x in j['jobs'])==sorted(names),'job matrix '+str(run))
+                  for job in j['jobs']:
+                      require(job['id'] not in ids and (job['run_id'],job['head_sha'],job['status'],job['conclusion'])==(run,HEAD,'completed','success'),'job evidence '+job['name'])
+                      same=[x for x in checks['check_runs'] if x['name']==job['name'] and x['app']['id']==APP]
+                      require(len(same)==1,'ambiguous check '+job['name']); ch=same[0]
+                      require((ch['id'],ch['head_sha'],ch['status'],ch['conclusion'],ch['check_suite']['id'])==(job['id'],HEAD,'completed','success',w['check_suite_id']),'check provenance '+job['name'])
+                      ids.add(job['id']); count+=1
+              require(count==23,'job total')
+              check_pr(fetch('pulls/416'))
+              b=fetch('branches/main'); require(b['commit']['sha']==BASE and b['protected'] is True,'final base')
+              return {'state':'READ_ONLY_EVIDENCE_PASS','candidate':HEAD,'workflows':len(RUNS),'jobs':count,'published':False,'release_authorized':False}
+
+          if __name__=='__main__':
+              try: print(json.dumps(verify(),indent=2))
+              except (Denied,URLError,OSError,ValueError,TypeError,KeyError,IndexError) as e:
+                  print('HOLD: '+(str(e) if isinstance(e,Denied) else type(e).__name__))
+                  raise SystemExit(1)
+          GOV_END_04_0
+          cat > test_remote.py <<'GOV_END_04_1'
+          import unittest, copy
+          import verify_remote as v
+
+          def fixture():
+              p={'number':416,'state':'open','merged':False,'head':{'sha':v.HEAD,'ref':v.BRANCH,'repo':{'id':v.RID,'full_name':v.REPO}},'base':{'sha':v.BASE,'ref':'main','repo':{'id':v.RID,'full_name':v.REPO}}}
+              data={'pulls/416':p,'branches/main':{'name':'main','commit':{'sha':v.BASE},'protected':True},'git/commits/'+v.HEAD:{'sha':v.HEAD,'parents':[{'sha':v.PARENT}],'tree':{'sha':v.TREE}},'git/trees/'+v.TREE+'?recursive=1':{'sha':v.TREE,'truncated':False,'tree':[{'path':k,'sha':s,'mode':'100644','type':'blob'} for k,s in v.ENTRIES.items()]}}
+              checks=[]
+              for run,(wid,names) in v.RUNS.items():
+                  data['actions/runs/'+str(run)]={'id':run,'workflow_id':wid,'head_sha':v.HEAD,'head_branch':v.BRANCH,'event':'pull_request','run_attempt':1,'status':'completed','conclusion':'success','repository':{'id':v.RID},'head_repository':{'id':v.RID},'check_suite_id':run+1,'pull_requests':[copy.deepcopy(p)]}
+                  jobs=[]
+                  for name in names:
+                      ident=len(checks)+1
+                      jobs.append({'id':ident,'name':name,'run_id':run,'head_sha':v.HEAD,'status':'completed','conclusion':'success'})
+                      checks.append({'id':ident,'name':name,'app':{'id':v.APP},'head_sha':v.HEAD,'status':'completed','conclusion':'success','check_suite':{'id':run+1}})
+                  data['actions/runs/'+str(run)+'/jobs?per_page=100']={'total_count':len(jobs),'jobs':jobs}
+              data['commits/'+v.HEAD+'/check-runs?per_page=100&filter=latest']={'total_count':len(checks),'check_runs':checks}
+              return data
+          class TestRemote(unittest.TestCase):
+              def test_valid(self): self.assertEqual(v.verify(fixture().__getitem__)['jobs'],23)
+              def test_fail_closed(self):
+                  c='git/commits/'+v.HEAD; t='git/trees/'+v.TREE+'?recursive=1'; w='actions/runs/45937846157'; j=w+'/jobs?per_page=100'; k='commits/'+v.HEAD+'/check-runs?per_page=100&filter=latest'
+                  variants=[('head',lambda d:d['pulls/416']['head'].update(sha='other')),('base',lambda d:d['pulls/416']['base'].update(sha='other')),('repo',lambda d:d['pulls/416']['head']['repo'].update(id=0)),('merged',lambda d:d['pulls/416'].update(merged=True)),('protection',lambda d:d['branches/main'].update(protected=False)),('parent',lambda d:d[c]['parents'].append({'sha':'other'})),('tree',lambda d:d[c]['tree'].update(sha='other')),('truncated',lambda d:d[t].update(truncated=True)),('script blob',lambda d:d[t]['tree'][-1].update(sha='other')),('script mode',lambda d:d[t]['tree'][-1].update(mode='100755')),('workflow attempt',lambda d:d[w].update(run_attempt=2)),('workflow event',lambda d:d[w].update(event='push')),('workflow identity',lambda d:d[w].update(workflow_id=0)),('missing PR',lambda d:d[w].update(pull_requests=[])),('skipped job',lambda d:d[j]['jobs'][0].update(conclusion='skipped')),('missing job',lambda d:d[j]['jobs'].pop()),('wrong job sha',lambda d:d[j]['jobs'][0].update(head_sha='other')),('wrong app',lambda d:d[k]['check_runs'][0]['app'].update(id=0)),('wrong suite',lambda d:d[k]['check_runs'][0]['check_suite'].update(id=0)),('duplicate check',lambda d:(d[k]['check_runs'].append(copy.deepcopy(d[k]['check_runs'][0])),d[k].update(total_count=24))),('incomplete page',lambda d:d[k].update(total_count=24))]
+                  for name,change in variants:
+                      with self.subTest(name=name):
+                          d=fixture(); change(d)
+                          with self.assertRaises(v.Denied): v.verify(d.__getitem__)
+              def test_race(self):
+                  d=fixture(); n=0
+                  def get(p):
+                      nonlocal n
+                      if p=='pulls/416':
+                          n+=1
+                          if n==2: d[p]['head']['sha']='other'
+                      return d[p]
+                  with self.assertRaises(v.Denied): v.verify(get)
+          if __name__=='__main__':unittest.main(verbosity=2)
+          GOV_END_04_1
+          cat > emitter.py <<'GOV_END_04_2'
+          """GOV-ADMISSION-04: attestation emitter core; no live entrypoint.
+          No candidate code is loaded. Authentication and real activation are a separate gate.
+          """
+          import json
+          import re
+          from urllib.request import Request, build_opener
+          from urllib.parse import urlsplit
+          from verify_remote import verify, check_pr, require, Denied, NoRedirect, REPO, RID, HEAD, BASE
+
+          APP_ID = 5948191
+          GOV = 'antoniocorsano-boop/registro-docente-governance'
+          CHECK = 'gov-admission-independent'
+          EMIT_WORKFLOW = '.github/workflows/gov-admission-emit.yml'
+          EXPECTED = {'state':'READ_ONLY_EVIDENCE_PASS','candidate':HEAD,'workflows':12,'jobs':23,'published':False,'release_authorized':False}
+
+
+          def context_guard(env):
+              expected = {'GITHUB_REPOSITORY':GOV,'GITHUB_REF':'refs/heads/main',
+                          'GITHUB_EVENT_NAME':'workflow_dispatch','GITHUB_RUN_ATTEMPT':'1',
+                          'GITHUB_WORKFLOW_REF':GOV+'/'+EMIT_WORKFLOW+'@refs/heads/main',
+                          'GOV_ADMISSION_MODE':'live'}
+              for key,value in expected.items():
+                  require(env.get(key)==value,'context '+key)
+              run = env.get('GITHUB_RUN_ID','')
+              require(isinstance(run,str) and re.fullmatch(r'[1-9][0-9]{0,19}',run) is not None,'run identity')
+              return run
+
+
+          def check_scope(data):
+              require(data['total_count']==1 and len(data['repositories'])==1,'installation scope')
+              repo=data['repositories'][0]
+              require((repo['id'],repo['full_name'])==(RID,REPO),'installation repository')
+
+
+          def emit(env, fetch, scope, identity, post):
+              """Called only by a future, independently reviewed privileged workflow.
+              No retry on POST error: ambiguous result requires read-only reconciliation.
+              """
+              run=context_guard(env)
+              require(identity()==APP_ID,'verified App identity')
+              check_scope(scope())
+              result=verify(fetch)
+              require(result==EXPECTED,'exact evidence result')
+              checks=fetch('commits/'+HEAD+'/check-runs?per_page=100&filter=latest')
+              require(checks['total_count']==len(checks['check_runs']) and len(checks['check_runs'])<100,'incomplete checks')
+              same=[x for x in checks['check_runs'] if x['name']==CHECK]
+              require(not same,'existing or conflicting attestation: reconcile, do not duplicate')
+              check_pr(fetch('pulls/416'))
+              b=fetch('branches/main')
+              require(b['name']=='main' and b['commit']['sha']==BASE and b['protected'] is True,'final base')
+              payload={'name':CHECK,'head_sha':HEAD,'status':'completed','conclusion':'success',
+                       'external_id':'GOV-ADMISSION-04:'+HEAD+':'+run,
+                       'details_url':'https://github.com/'+GOV+'/actions/runs/'+run,
+                       'output':{'title':'Independent exact-candidate evidence verified',
+                                 'summary':'12 workflows, 23 jobs; evidence only. Not a merge or release authorization.'}}
+              reply=post(payload)
+              require((reply['name'],reply['head_sha'],reply['status'],reply['conclusion'],reply['app']['id'],reply['external_id'])==
+                      (CHECK,HEAD,'completed','success',APP_ID,payload['external_id']),'post response identity')
+              require(type(reply['id']) is int and reply['id']>0,'check identity')
+              return {'state':'CHECK_EMITTED','check_id':reply['id'],'candidate':HEAD,'release_authorized':False}
+
+
+          class InstallationTransport:
+              """Prepared transport. Not used by qualification YAML. Token is ephemeral.
+              Future activation must obtain it from the pinned App and verify installation permissions.
+              """
+              def __init__(self, token, opener=None):
+                  require(isinstance(token,str) and token and not any(c.isspace() for c in token),'invalid token')
+                  self._token=token
+                  self._opener=opener or build_opener(NoRedirect())
+
+              def _request(self, method, path, body=None):
+                  # Only the fixed repository and scope endpoint; no caller-controlled origin.
+                  valid_get=(path=='/installation/repositories?per_page=100' or
+                             path.startswith('/repos/'+REPO+'/'))
+                  valid_post=path=='/repos/'+REPO+'/check-runs'
+                  require((method=='GET' and body is None and valid_get) or (method=='POST' and valid_post and isinstance(body,dict)), 'transport route')
+                  require('..' not in path and '#' not in path and '%' not in path and '\\' not in path, 'transport path')
+                  url='https://api.github.com'+path
+                  headers={'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28',
+                           'User-Agent':'Registro-Docente-Governance','Authorization':'Bearer '+self._token}
+                  if body is not None: headers['Content-Type']='application/json'
+                  req=Request(url, data=None if body is None else json.dumps(body).encode(),headers=headers,method=method)
+                  with self._opener.open(req,timeout=20) as f:
+                      require(urlsplit(f.geturl()).hostname=='api.github.com' and f.geturl()==url,'unexpected endpoint')
+                      require(f.status==(201 if method=='POST' else 200),'unexpected HTTP status')
+                      raw=f.read(20_000_001)
+                      require(len(raw)<=20_000_000,'response too large')
+                      return json.loads(raw)
+
+              def fetch(self,path): return self._request('GET','/repos/'+REPO+'/'+path)
+              def scope(self): return self._request('GET','/installation/repositories?per_page=100')
+              def post(self,payload):
+                  require(isinstance(payload,dict) and set(payload)=={'name','head_sha','status','conclusion','external_id','details_url','output'},'payload fields')
+                  require((payload['name'],payload['head_sha'],payload['status'],payload['conclusion'])==(CHECK,HEAD,'completed','success'),'payload identity')
+                  require(re.fullmatch(r'GOV-ADMISSION-04:'+HEAD+r':[1-9][0-9]{0,19}',payload['external_id']) is not None,'payload external ID')
+                  require(payload['details_url']=='https://github.com/'+GOV+'/actions/runs/'+payload['external_id'].rsplit(':',1)[1],'payload details URL')
+                  require(payload['output']=={'title':'Independent exact-candidate evidence verified','summary':'12 workflows, 23 jobs; evidence only. Not a merge or release authorization.'},'payload output')
+                  return self._request('POST','/repos/'+REPO+'/check-runs',payload)
+
+          if __name__=='__main__':
+              raise SystemExit('HOLD: live entrypoint not enabled; qualification only')
+          GOV_END_04_2
+          cat > test_emitter.py <<'GOV_END_04_3'
+          import copy, io, json, unittest
+          from unittest.mock import patch
+          import emitter as e
+          import verify_remote as v
+          from test_remote import fixture
+
+          CTX={'GITHUB_REPOSITORY':e.GOV,'GITHUB_REF':'refs/heads/main','GITHUB_EVENT_NAME':'workflow_dispatch',
+               'GITHUB_RUN_ATTEMPT':'1','GITHUB_WORKFLOW_REF':e.GOV+'/'+e.EMIT_WORKFLOW+'@refs/heads/main',
+               'GOV_ADMISSION_MODE':'live','GITHUB_RUN_ID':'123456'}
+          SCOPE={'total_count':1,'repositories':[{'id':v.RID,'full_name':v.REPO}]}
+          K='commits/'+v.HEAD+'/check-runs?per_page=100&filter=latest'
+
+          class TestEmitter(unittest.TestCase):
+              def setUp(self):
+                  self.data=fixture(); self.posts=[]; self.scope=copy.deepcopy(SCOPE)
+                  self.ctx=CTX.copy(); self.app=e.APP_ID
+              def post(self,payload):
+                  self.posts.append(copy.deepcopy(payload))
+                  return dict(payload, id=1, app={'id':e.APP_ID})
+              def run_emit(self, fetch=None, post=None):
+                  return e.emit(self.ctx,fetch or self.data.__getitem__,lambda:self.scope,lambda:self.app,post or self.post)
+              def denied(self, fetch=None):
+                  with self.assertRaises((v.Denied,KeyError,OSError,ValueError,TypeError)): self.run_emit(fetch)
+                  self.assertEqual(self.posts,[])
+              def test_exact_emission(self):
+                  self.assertEqual(self.run_emit(),{'state':'CHECK_EMITTED','check_id':1,'candidate':v.HEAD,'release_authorized':False})
+                  self.assertEqual(len(self.posts),1)
+                  self.assertEqual(self.posts[0]['name'],e.CHECK)
+                  self.assertEqual(self.posts[0]['head_sha'],v.HEAD)
+                  self.assertEqual(self.posts[0]['conclusion'],'success')
+                  self.assertNotIn('merge',self.posts[0].keys())
+              def test_wrong_context(self):
+                  for key in CTX:
+                      with self.subTest(key=key):
+                          self.ctx=CTX.copy(); self.ctx[key]='invalid'; self.denied()
+              def test_wrong_app_before_post(self):
+                  self.app=0; self.denied()
+              def test_scope_empty(self):
+                  self.scope={'total_count':0,'repositories':[]}; self.denied()
+              def test_scope_extra(self):
+                  self.scope['repositories'].append({'id':0,'full_name':'other/repo'}); self.scope['total_count']=2; self.denied()
+              def test_scope_wrong_id(self):
+                  self.scope['repositories'][0]['id']=0; self.denied()
+              def test_scope_wrong_name(self):
+                  self.scope['repositories'][0]['full_name']='other/repo'; self.denied()
+              def test_candidate_changed(self):
+                  self.data['pulls/416']['head']['sha']='other'; self.denied()
+              def test_base_changed(self):
+                  self.data['branches/main']['commit']['sha']='other'; self.denied()
+              def test_no_protection(self):
+                  self.data['branches/main']['protected']=False; self.denied()
+              def test_missing_job(self):
+                  self.data['actions/runs/45937846157/jobs?per_page=100']['jobs'].pop(); self.denied()
+              def test_skipped_job(self):
+                  self.data['actions/runs/45937846157/jobs?per_page=100']['jobs'][0]['conclusion']='skipped'; self.denied()
+              def test_wrong_workflow_app(self):
+                  self.data[K]['check_runs'][0]['app']['id']=0; self.denied()
+              def test_existing_attestation_any_source(self):
+                  self.data[K]['check_runs'].append(dict(name=e.CHECK,app={'id':0})); self.data[K]['total_count']+=1; self.denied()
+              def test_final_race(self):
+                  count=0
+                  def get(p):
+                      nonlocal count
+                      if p=='pulls/416':
+                          count+=1
+                          if count==3: self.data[p]['head']['sha']='other'
+                      return self.data[p]
+                  self.denied(get)
+              def test_api_unavailable(self):
+                  def get(p): raise OSError('synthetic')
+                  self.denied(get)
+              def test_wrong_result(self):
+                  with patch.object(e,'verify',return_value=dict(e.EXPECTED,jobs=22)): self.denied()
+              def test_post_response_wrong_source(self):
+                  def post(p): return dict(self.post(p),app={'id':0})
+                  with self.assertRaises(v.Denied): self.run_emit(post=post)
+                  self.assertEqual(len(self.posts),1)
+              def test_post_response_wrong_sha(self):
+                  def post(p): return dict(self.post(p),head_sha='other')
+                  with self.assertRaises(v.Denied): self.run_emit(post=post)
+                  self.assertEqual(len(self.posts),1)
+              def test_post_ambiguous_no_retry(self):
+                  def post(p): self.posts.append(p); raise OSError('synthetic timeout')
+                  with self.assertRaises(OSError): self.run_emit(post=post)
+                  self.assertEqual(len(self.posts),1)
+
+          class Response(io.BytesIO):
+              def __init__(self,url,status,body): super().__init__(json.dumps(body).encode()); self.url=url; self.status=status
+              def geturl(self): return self.url
+          class FakeOpener:
+              def __init__(self): self.calls=[]; self.redirect=False; self.status=None
+              def open(self,req,timeout):
+                  self.calls.append(req)
+                  return Response('https://example.invalid/' if self.redirect else req.full_url,self.status or (201 if req.method=='POST' else 200),{})
+          class TestTransport(unittest.TestCase):
+              def setUp(self): self.op=FakeOpener(); self.t=e.InstallationTransport('synthetic-not-a-token',self.op)
+              def payload(self):
+                  return {'name':e.CHECK,'head_sha':v.HEAD,'status':'completed','conclusion':'success','external_id':'GOV-ADMISSION-04:'+v.HEAD+':123456','details_url':'https://github.com/'+e.GOV+'/actions/runs/123456','output':{'title':'Independent exact-candidate evidence verified','summary':'12 workflows, 23 jobs; evidence only. Not a merge or release authorization.'}}
+              def test_fixed_get(self):
+                  self.t.fetch('pulls/416'); q=self.op.calls[0]
+                  self.assertEqual(q.full_url,'https://api.github.com/repos/'+v.REPO+'/pulls/416'); self.assertEqual(q.method,'GET')
+              def test_scope_endpoint(self):
+                  self.t.scope(); self.assertEqual(self.op.calls[0].full_url,'https://api.github.com/installation/repositories?per_page=100')
+              def test_fixed_post(self):
+                  self.t.post(self.payload()); self.assertEqual(self.op.calls[0].method,'POST'); self.assertTrue(self.op.calls[0].full_url.endswith('/check-runs'))
+              def test_reject_other_route(self):
+                  with self.assertRaises(v.Denied): self.t._request('POST','/repos/other/repo/check-runs',{})
+                  self.assertEqual(self.op.calls,[])
+              def test_reject_traversal(self):
+                  with self.assertRaises(v.Denied): self.t.fetch('../other')
+                  self.assertEqual(self.op.calls,[])
+              def test_reject_redirect(self):
+                  self.op.redirect=True
+                  with self.assertRaises(v.Denied): self.t.scope()
+              def test_reject_status(self):
+                  self.op.status=202
+                  with self.assertRaises(v.Denied): self.t.post(self.payload())
+              def test_reject_arbitrary_check(self):
+                  p=self.payload(); p['name']='other'
+                  with self.assertRaises(v.Denied): self.t.post(p)
+                  self.assertEqual(self.op.calls,[])
+              def test_reject_other_sha(self):
+                  p=self.payload(); p['head_sha']='other'
+                  with self.assertRaises(v.Denied): self.t.post(p)
+                  self.assertEqual(self.op.calls,[])
+              def test_empty_token(self):
+                  with self.assertRaises(v.Denied): e.InstallationTransport('',self.op)
+          if __name__=='__main__': unittest.main(verbosity=2)
+          GOV_END_04_3
+          cat > SHA256SUMS <<'GOV_END_04_4'
+          78341d2f05be9302401ac299905200baa7225b574b5b8d7d2f786dd7552600c1  verify_remote.py
+          6eae5faef1c1f8794f2cdc8437d3e34039fe96dd0717111e1abf0c38b36e2289  test_remote.py
+          1a8edc7ec1e6f74d0f83d18d6d01328d8dd24609a85ebc3d5e2c20890029511d  emitter.py
+          69422a6b3ff63d11bce67234351d678465e47702190ed7a35d334be4899484b0  test_emitter.py
+          GOV_END_04_4
+          sha256sum -c SHA256SUMS
+          python3 -m unittest -v test_remote test_emitter

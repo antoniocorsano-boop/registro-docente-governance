@@ -41,9 +41,9 @@ jobs:
     if: github.repository == 'antoniocorsano-boop/registro-docente-governance' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.run_attempt == 1 && github.actor_id == '233439245' && github.triggering_actor == 'antoniocorsano-boop'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-    environment: GOV-ADMISSION
     steps:
-      - name: Verify context and synthetic regressions (no secrets)
+      - &prepare_sources
+        name: Verify context and prepare qualified sources (no secrets)
         shell: bash
         run: |
           set -euo pipefail
@@ -221,9 +221,21 @@ jobs:
           f4875a62cd7c45b7706dda55da69d42d80559f9e4bb5254818def0d252160515  test_auth_probe.py
           GOV05_END_2
           sha256sum -c SHA256SUMS
+      - name: Run synthetic regressions (no secrets)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/gov-admission-05"
           python3 -m unittest -v test_auth_probe
+  authenticate:
+    needs: [preflight, qualification]
+    if: github.repository == 'antoniocorsano-boop/registro-docente-governance' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.run_attempt == 1 && github.actor_id == '233439245' && github.triggering_actor == 'antoniocorsano-boop' && inputs.mode == 'authenticate'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: GOV-ADMISSION
+    steps:
+      - *prepare_sources
       - name: Verify actual App and installation (read-only token; no publication)
-        if: inputs.mode == 'authenticate'
         shell: bash
         env:
           GOV_ADMISSION_MODE: authenticate
@@ -234,7 +246,7 @@ jobs:
           sha256sum -c SHA256SUMS
           python3 auth_probe.py
   outcome:
-    needs: [preflight, qualification]
+    needs: [preflight, qualification, authenticate]
     if: ${{ always() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 2
@@ -244,7 +256,13 @@ jobs:
         env:
           PREFLIGHT_RESULT: ${{ needs.preflight.result }}
           QUALIFICATION_RESULT: ${{ needs.qualification.result }}
+          AUTHENTICATION_RESULT: ${{ needs.authenticate.result }}
+          GOV_REQUESTED_MODE: ${{ inputs.mode }}
         run: |
           set -euo pipefail
           [[ "$PREFLIGHT_RESULT" == success && "$QUALIFICATION_RESULT" == success ]] || { echo 'HOLD: mandatory job did not succeed' >&2; exit 1; }
+          case "$GOV_REQUESTED_MODE:$AUTHENTICATION_RESULT" in
+            synthetic:skipped|authenticate:success) ;;
+            *) echo 'HOLD: authentication outcome inconsistent with mode' >&2; exit 1 ;;
+          esac
           echo 'MANDATORY_JOBS_PASS'

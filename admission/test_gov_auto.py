@@ -1,10 +1,24 @@
 import copy
+import json
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 import gov_auto as a
 
 PERMS={'actions':'read','checks':'write','contents':'read','metadata':'read','pull_requests':'read'}
 PROOF={'state':'AUTH_SCOPE_PASS','app_id':a.APP,'installation_id':a.INSTALLATION,'repository_count':1,'token_revoked':True,'check_published':False,'release_authorized':False}
 ENV={'GITHUB_REPOSITORY':a.GOV,'GITHUB_REF':'refs/heads/main','GITHUB_REF_PROTECTED':'true','GITHUB_EVENT_NAME':'push','GITHUB_RUN_ATTEMPT':'1','GITHUB_ACTOR_ID':a.OWNER,'GITHUB_TRIGGERING_ACTOR':'antoniocorsano-boop','GITHUB_WORKFLOW_REF':a.GOV+'/'+a.WORKFLOW+'@refs/heads/main','GITHUB_SHA':'a'*40,'GITHUB_WORKFLOW_SHA':'a'*40,'GITHUB_RUN_ID':'1234'}
+
+def historical_manifest():
+    # The migration/equivalence evidence is tied to the qualified #416 fixture,
+    # never to the operational candidate.json selected for this workflow run.
+    return {'schema':1,'policy':a.POLICY,'pr':416,'head':a.old.HEAD,'base':a.old.BASE,
+            'parent':a.old.PARENT,'tree':a.old.TREE,'branch':a.old.BRANCH}
+
+def future_manifest():
+    return {'schema':1,'policy':a.POLICY,'pr':500,'head':'b'*40,'base':'c'*40,
+            'parent':'d'*40,'tree':'e'*40,'branch':'candidate/next'}
 
 def fixture(m):
     p={'number':m['pr'],'state':'open','merged':False,'head':{'sha':m['head'],'ref':m['branch'],'repo':{'id':a.old.RID,'full_name':a.old.REPO}},'base':{'sha':m['base'],'ref':'main','repo':{'id':a.old.RID,'full_name':a.old.REPO}}}
@@ -37,7 +51,7 @@ class FakeTransport:
 
 class Tests(unittest.TestCase):
     def setUp(self):
-        self.m=a.load_manifest(); self.env=ENV.copy(); self.data=fixture(self.m); self.calls=[]; self.posts=[]; self.revoked=[]
+        self.m=historical_manifest(); self.env=ENV.copy(); self.data=fixture(self.m); self.calls=[]; self.posts=[]; self.revoked=[]
         self.scope={'total_count':1,'repositories':[{'id':a.old.RID,'full_name':a.old.REPO}]}; self.proof=PROOF.copy(); self.perms=PERMS.copy()
         self.post_error=False; self.reply_wrong=False; self.readback_missing=False; self.issue_error=False; self.revoke_error=False; self.gov_count=0; self.gov_race=False
     def key(self,f): return 'commits/'+self.m['head']+'/check-runs?per_page=100&filter='+f
@@ -62,7 +76,24 @@ class Tests(unittest.TestCase):
     def test_equivalent_to_qualified_verifier(self):
         original=a.old.verify(self.data.__getitem__); new=self.plan(); self.assertEqual((new['candidate'],new['workflows'],new['jobs']),(original['candidate'],original['workflows'],original['jobs'])); self.assertEqual(new['decision'],'ready')
     def test_future_candidate_not_frozen(self):
-        self.m.update(pr=500,head='b'*40,base='c'*40,parent='d'*40,tree='e'*40,branch='candidate/next'); self.data=fixture(self.m); self.assertEqual(self.plan()['candidate'],'b'*40)
+        self.m=future_manifest(); self.data=fixture(self.m); self.assertEqual(self.plan()['candidate'],'b'*40)
+    def test_fixture_independence_without_operational_loader(self):
+        with patch.object(a,'load_manifest',side_effect=AssertionError('operational manifest must not be used by fixtures')):
+            probe=Tests(); probe.setUp()
+            probe.test_equivalent_to_qualified_verifier()
+            probe.test_existing_attestation_no_second_emission()
+            probe.setUp(); probe.test_future_candidate_not_frozen()
+    def test_operational_manifest_loader_is_separate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); candidate=root/'candidate.json'
+            with patch.object(a,'ROOT',root):
+                for expected in (historical_manifest(),future_manifest()):
+                    candidate.write_text(json.dumps(expected),encoding='utf-8')
+                    self.assertEqual(a.load_manifest(),expected)
+                    self.assertEqual(historical_manifest()['head'],a.old.HEAD)
+                    self.assertEqual(future_manifest()['head'],'b'*40)
+                candidate.write_text('{"schema":1,"schema":1}',encoding='utf-8')
+                with self.assertRaisesRegex(a.Hold,'duplicate manifest key'):a.load_manifest()
     def test_context_fail_closed(self):
         for k in ENV:
             with self.subTest(k=k):
@@ -75,7 +106,7 @@ class Tests(unittest.TestCase):
     def test_existing_attestation_no_second_emission(self):
         self.add_check(self.existing()); self.assertEqual(self.plan()['decision'],'already'); self.assertEqual(self.live()['state'],'ALREADY_ATTESTED'); self.assertEqual(self.posts,[]); self.assertEqual(self.revoked,['synthetic'])
     def test_future_attestation_bound_to_policy(self):
-        self.m.update(pr=500,head='b'*40,base='c'*40,parent='d'*40,tree='e'*40,branch='candidate/next'); self.data=fixture(self.m)
+        self.m=future_manifest(); self.data=fixture(self.m)
         self.add_check(dict(a.payload(self.m,'777'),id=88,app={'id':a.APP})); self.assertEqual(self.plan()['decision'],'already')
         self.data=fixture(self.m); self.add_check(self.existing())
         with self.assertRaises(a.Hold):self.plan()

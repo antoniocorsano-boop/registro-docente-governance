@@ -15,7 +15,29 @@ concurrency:
   group: gov-admission-auth-probe
   cancel-in-progress: false
 jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Reject unauthorized context explicitly (no credentials)
+        shell: bash
+        env:
+          GOV_REQUESTED_MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          deny() { printf 'HOLD: unauthorized workflow context (%s)\n' "$1" >&2; exit 1; }
+          [[ "$GITHUB_REPOSITORY" == antoniocorsano-boop/registro-docente-governance ]] || deny repository
+          [[ "$GITHUB_REF" == refs/heads/main ]] || deny ref
+          [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]] || deny event
+          [[ "$GITHUB_RUN_ATTEMPT" == 1 ]] || deny attempt
+          [[ "$GITHUB_ACTOR_ID" == 233439245 ]] || deny actor
+          [[ "$GITHUB_TRIGGERING_ACTOR" == antoniocorsano-boop ]] || deny triggering_actor
+          [[ "$GITHUB_WORKFLOW_REF" == antoniocorsano-boop/registro-docente-governance/.github/workflows/gov-admission-auth-probe.yml@refs/heads/main ]] || deny workflow_ref
+          [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]] || deny run_id
+          case "$GOV_REQUESTED_MODE" in synthetic|authenticate) ;; *) deny mode ;; esac
+          echo 'CONTEXT_PASS'
   qualification:
+    needs: preflight
     if: github.repository == 'antoniocorsano-boop/registro-docente-governance' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.run_attempt == 1 && github.actor_id == '233439245' && github.triggering_actor == 'antoniocorsano-boop'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -211,3 +233,18 @@ jobs:
           cd "$RUNNER_TEMP/gov-admission-05"
           sha256sum -c SHA256SUMS
           python3 auth_probe.py
+  outcome:
+    needs: [preflight, qualification]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Require actual completion (no credentials)
+        shell: bash
+        env:
+          PREFLIGHT_RESULT: ${{ needs.preflight.result }}
+          QUALIFICATION_RESULT: ${{ needs.qualification.result }}
+        run: |
+          set -euo pipefail
+          [[ "$PREFLIGHT_RESULT" == success && "$QUALIFICATION_RESULT" == success ]] || { echo 'HOLD: mandatory job did not succeed' >&2; exit 1; }
+          echo 'MANDATORY_JOBS_PASS'

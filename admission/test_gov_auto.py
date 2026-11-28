@@ -322,6 +322,12 @@ class R1Build01aTests(unittest.TestCase):
         self.tree()[0]['mode']='120000'
         with self.assertRaisesRegex(a.Hold,'policy blob drift'):a.public_plan(self.m,self.data.__getitem__)
 
+    def test_v2_shipped_manifest(self):
+        # Read the actual committed candidate.json, not a temporary copy.
+        self.assertEqual(a.load_manifest(), V2_EXPECTED)
+        m, data = v2_fixture()
+        self.assertEqual(a.plan(a.load_manifest(), data.__getitem__)['decision'], 'ready')
+
     def test_v2_manifest_loader_independent_of_v1(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);candidate=root/'candidate.json'

@@ -322,11 +322,35 @@ class R1Build01aTests(unittest.TestCase):
         self.tree()[0]['mode']='120000'
         with self.assertRaisesRegex(a.Hold,'policy blob drift'):a.public_plan(self.m,self.data.__getitem__)
 
-    def test_v2_shipped_manifest(self):
-        # Read the actual committed candidate.json, not a temporary copy.
-        self.assertEqual(a.load_manifest(), V2_EXPECTED)
-        m, data = v2_fixture()
-        self.assertEqual(a.plan(a.load_manifest(), data.__getitem__)['decision'], 'ready')
+    def test_shipped_manifest_selected_policy(self):
+        # Validate the operational file; never freeze ordinary V1 registration.
+        m = a.load_manifest()
+        if m['policy'] == a.V2_POLICY:
+            self.assertEqual(m, V2_EXPECTED)
+            _, data = v2_fixture()
+        else:
+            self.assertEqual(m['policy'], a.POLICY)
+            data = fixture(m)
+        self.assertEqual(a.plan(m, data.__getitem__),
+                         {'decision':'ready','candidate':m['head'],'workflows':12,
+                          'jobs':23,'check_id':None,'release_authorized':False})
+
+    def test_operational_manifest_accepts_v1_replacement(self):
+        # Exercise the same operational-file test with each supported policy.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            candidate = root/'candidate.json'
+            with patch.object(a,'ROOT',root):
+                for expected in (V2_EXPECTED, historical_manifest(), future_manifest()):
+                    with self.subTest(policy=expected['policy'], pr=expected['pr']):
+                        candidate.write_text(json.dumps(expected), encoding='utf-8')
+                        self.test_shipped_manifest_selected_policy()
+                for invalid in (dict(V2_EXPECTED, policy=a.POLICY),
+                                dict(V2_EXPECTED, head='f'*40),
+                                dict(future_manifest(), policy='unknown')):
+                    candidate.write_text(json.dumps(invalid), encoding='utf-8')
+                    with self.subTest(invalid=invalid), self.assertRaises(a.Hold):
+                        self.test_shipped_manifest_selected_policy()
 
     def test_v2_manifest_loader_independent_of_v1(self):
         with tempfile.TemporaryDirectory() as directory:

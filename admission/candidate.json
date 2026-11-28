@@ -1,10 +1,10 @@
 {
   "schema": 1,
-  "policy": "RD-12-23-V1",
+  "policy": "RD-12-23-V2-R1-BUILD-01A",
   "pr": 416,
-  "head": "1b83f6364985b89cdbd89b73e6c382bd6300f655",
+  "head": "2e53609d1e627d008e745f043b4e8909b8ed02c3",
   "base": "1e9bcd0eb8bd5c7e72ea059b3f90f72805f9cdd1",
-  "parent": "b142cc03a8d6b90ee93ec93045e7455ce34639d8",
-  "tree": "ccf173d4cdfedf44533b1d1d7db7bff70b034418",
+  "parent": "c05702fdbd85f3c8bc89dfedfb43df8aee3a85ec",
+  "tree": "9c1b8205d68ca26fd1b5a3f86dc2b2e8c2c11d71",
   "branch": "candidate/cand-prod-01"
 }

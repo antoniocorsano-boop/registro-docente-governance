@@ -39,6 +39,36 @@ JOBS = {wid: tuple(names) for wid, names in old.RUNS.values()}
 ENTRIES = dict(old.ENTRIES)
 ENTRIES.update({'.github/workflows/' + path: blob for path, blob in PATHS.values()})
 
+# Proposed exact build-policy successor; V1 and its historical attestation remain unchanged.
+V2_POLICY = 'RD-12-23-V2-R1-BUILD-01A'
+V2_MANIFEST = {'schema': 1,
+ 'policy': 'RD-12-23-V2-R1-BUILD-01A',
+ 'pr': 416,
+ 'head': '2e53609d1e627d008e745f043b4e8909b8ed02c3',
+ 'base': '1e9bcd0eb8bd5c7e72ea059b3f90f72805f9cdd1',
+ 'parent': 'c05702fdbd85f3c8bc89dfedfb43df8aee3a85ec',
+ 'tree': '9c1b8205d68ca26fd1b5a3f86dc2b2e8c2c11d71',
+ 'branch': 'candidate/cand-prod-01'}
+V2_DELTA = {'.github/workflows/ap02-f2-native-device.yml': '5378b84cf48d537dff105c181a037dc7f0293590',
+ '.github/workflows/mobile-01-android-probe.yml': 'f799960ac848a7dc711a83a75a5f11f21aa6576a',
+ '.github/workflows/qa-appium-replacement-pilot.yml': 'aea9cc43b1f86530f7eecad921a241597e5c0e23',
+ '.github/workflows/val01-native-evidence.yml': '6564f1eae2838d23e2e18502b7fe35a8ceeaf08e',
+ 'mobile/android-probe/.gitignore': '60ff708259ae686b99baa2bde8625465f2ae74fe',
+ 'mobile/android-probe/build-contract.py': '834f29d61c4c5b8b3d7ab49ae77de7409087d116',
+ 'mobile/android-probe/build-inventory.init.gradle': '633ccf85fd94ea2b63f8fe6599e23c31a7e818f3',
+ 'mobile/android-probe/gradle-8.14.8/.gitattributes': '3cec56724bc7eb7b519330c29c44a369cb8e90be',
+ 'mobile/android-probe/gradle-8.14.8/gradle-wrapper.jar': '02f06ab2a396743f0052e4328b0e5ac2cdd8b3d2',
+ 'mobile/android-probe/gradle-8.14.8/gradlew': '23d15a9367071145e9c79bb4ddf879d1fbe78b5d',
+ 'mobile/android-probe/gradle-8.14.8/gradlew.bat': '5eed7ee8452842305a18a4eb967442683808226a',
+ 'mobile/android-probe/package-lock.json': 'e6d10b0004fcf98fd5abdb15c3e50fab6efac042',
+ 'mobile/android-probe/probe-npm.sh': '2cee04e14a14b1375e4a773910bce85988b531fa',
+ 'mobile/android-probe/test_native_inventory.py': '6ad00aeb84cbdfd91ba39690d3f5eff2f63aa107',
+ 'mobile/android-probe/verification-metadata.xml': '171aff841a11b8307f5ef1ccdece58a47615cda4',
+ 'mobile/android-probe/verify-build-inventory.py': '018b89b6ec0c407634858164fbf84a642a861a22',
+ 'scripts/diagnostics/android-r3-admission.sh': '365666236452a36ba1c54c8eb951835f8c686791',
+ 'scripts/diagnostics/appium-pilot/contract.test.mjs': 'bf198e13fe028a689769dbfe3ba0cf6dadf12ac5'}
+V2_EXECUTABLE = 'mobile/android-probe/gradle-8.14.8/gradlew'
+
 class Hold(Exception): pass
 
 def need(ok, label):
@@ -63,11 +93,24 @@ def context(env):
 
 def manifest(m):
     need(type(m) is dict and set(m) == {'schema','policy','pr','head','base','parent','tree','branch'}, 'manifest fields')
-    need(type(m['schema']) is int and m['schema'] == 1 and m['policy'] == POLICY and number(m['pr']), 'manifest policy/PR')
+    need(type(m['schema']) is int and m['schema'] == 1 and m['policy'] in (POLICY, V2_POLICY) and number(m['pr']), 'manifest policy/PR')
     need(all(sha(m[k]) for k in ('head','base','parent','tree')) and m['head'] != m['base'], 'manifest SHA')
     need(isinstance(m['branch'], str) and re.fullmatch(r'candidate/[A-Za-z0-9][A-Za-z0-9_-]{0,79}', m['branch']) is not None, 'candidate branch')
     need(set(PATHS) == set(JOBS) and len(JOBS) == 12 and sum(map(len, JOBS.values())) == 23 and len(ENTRIES) == 14, 'fixed policy')
+    if m['policy'] == V2_POLICY:
+        need(m == V2_MANIFEST, 'exact V2 manifest')
+    else:
+        need(m['head'] != V2_MANIFEST['head'], 'V2 candidate requires V2 policy')
     return m.copy()
+
+def policy_entries(m):
+    m = manifest(m)
+    pins = dict(ENTRIES)
+    if m['policy'] == V2_POLICY:
+        pins.update(V2_DELTA)
+        need(len(pins) == 28 and len(V2_DELTA) == 18 and V2_EXECUTABLE in pins, 'fixed V2 policy')
+    return {path:(digest,'100755' if m['policy'] == V2_POLICY and path == V2_EXECUTABLE else '100644','blob')
+            for path,digest in pins.items()}
 
 def complete(data, key):
     rows = data[key]
@@ -95,11 +138,11 @@ def attestation(m, fetch):
     need(len(same) == 1, 'duplicate attestation')
     c = same[0]
     need((c['app']['id'],c['head_sha'],c['status'],c['conclusion']) == (APP,m['head'],'completed','success') and number(c['id']), 'conflicting attestation')
-    pattern = r'GOV-AUTO-01:' + POLICY + ':' + m['head'] + r':([1-9][0-9]{0,19})'
+    pattern = r'GOV-AUTO-01:' + re.escape(m['policy']) + ':' + m['head'] + r':([1-9][0-9]{0,19})'
     match = re.fullmatch(pattern, c['external_id'] or '')
     # Only the already-qualified historical check is grandfathered into this policy.
     if match is None:
-        need(m['head'] == old.HEAD and c['id'] == 140661146635 and c['external_id'] == 'GOV-ADMISSION-04:'+old.HEAD+':46044433279', 'historical attestation binding')
+        need(m['policy'] == POLICY and m['head'] == old.HEAD and c['id'] == 140661146635 and c['external_id'] == 'GOV-ADMISSION-04:'+old.HEAD+':46044433279', 'historical attestation binding')
         source_run = '46044433279'
     else: source_run = match[1]
     need(c['details_url'] == 'https://github.com/' + GOV + '/actions/runs/' + source_run, 'attestation provenance')
@@ -113,9 +156,9 @@ def plan(m, fetch):
     need(c['sha'] == m['head'] and [x['sha'] for x in c['parents']] == [m['parent']] and c['tree']['sha'] == m['tree'], 'commit parent/tree')
     t = fetch('git/trees/' + m['tree'] + '?recursive=1')
     need(t['sha'] == m['tree'] and t['truncated'] is False, 'complete tree')
-    for path, digest in ENTRIES.items():
+    for path, expected in policy_entries(m).items():
         rows = [x for x in t['tree'] if x['path'] == path]
-        need(len(rows) == 1 and (rows[0]['sha'],rows[0]['mode'],rows[0]['type']) == (digest,'100644','blob'), 'policy blob drift')
+        need(len(rows) == 1 and (rows[0]['sha'],rows[0]['mode'],rows[0]['type']) == expected, 'policy blob drift')
     runs = complete(fetch('actions/runs?head_sha=' + m['head'] + '&event=pull_request&per_page=100'), 'workflow_runs')
     checks = complete(fetch('commits/' + m['head'] + '/check-runs?per_page=100&filter=latest'), 'check_runs')
     ids = set(); run_ids = set()
@@ -208,8 +251,9 @@ def protected_plan(m, credential, probe, request, fetch_factory):
 
 
 def payload(m, run):
+    m = manifest(m)
     return {'name':CHECK,'head_sha':m['head'],'status':'completed','conclusion':'success',
-            'external_id':'GOV-AUTO-01:'+POLICY+':'+m['head']+':'+run,
+            'external_id':'GOV-AUTO-01:'+m['policy']+':'+m['head']+':'+run,
             'details_url':'https://github.com/'+GOV+'/actions/runs/'+run,
             'output':OUTPUT.copy()}
 

@@ -191,4 +191,173 @@ class Tests(unittest.TestCase):
         for k in body:
             with self.subTest(k=k),self.assertRaises(a.Hold):t.post(dict(body,**{k:'wrong'}))
 
+
+# R1-BUILD-01a: exact manifest and expected remote tree entries.
+V2_EXPECTED = {'schema': 1,
+ 'policy': 'RD-12-23-V2-R1-BUILD-01A',
+ 'pr': 416,
+ 'head': '2e53609d1e627d008e745f043b4e8909b8ed02c3',
+ 'base': '1e9bcd0eb8bd5c7e72ea059b3f90f72805f9cdd1',
+ 'parent': 'c05702fdbd85f3c8bc89dfedfb43df8aee3a85ec',
+ 'tree': '9c1b8205d68ca26fd1b5a3f86dc2b2e8c2c11d71',
+ 'branch': 'candidate/cand-prod-01'}
+V2_EXPECTED_DELTA = {'.github/workflows/ap02-f2-native-device.yml': '5378b84cf48d537dff105c181a037dc7f0293590',
+ '.github/workflows/mobile-01-android-probe.yml': 'f799960ac848a7dc711a83a75a5f11f21aa6576a',
+ '.github/workflows/qa-appium-replacement-pilot.yml': 'aea9cc43b1f86530f7eecad921a241597e5c0e23',
+ '.github/workflows/val01-native-evidence.yml': '6564f1eae2838d23e2e18502b7fe35a8ceeaf08e',
+ 'mobile/android-probe/.gitignore': '60ff708259ae686b99baa2bde8625465f2ae74fe',
+ 'mobile/android-probe/build-contract.py': '834f29d61c4c5b8b3d7ab49ae77de7409087d116',
+ 'mobile/android-probe/build-inventory.init.gradle': '633ccf85fd94ea2b63f8fe6599e23c31a7e818f3',
+ 'mobile/android-probe/gradle-8.14.8/.gitattributes': '3cec56724bc7eb7b519330c29c44a369cb8e90be',
+ 'mobile/android-probe/gradle-8.14.8/gradle-wrapper.jar': '02f06ab2a396743f0052e4328b0e5ac2cdd8b3d2',
+ 'mobile/android-probe/gradle-8.14.8/gradlew': '23d15a9367071145e9c79bb4ddf879d1fbe78b5d',
+ 'mobile/android-probe/gradle-8.14.8/gradlew.bat': '5eed7ee8452842305a18a4eb967442683808226a',
+ 'mobile/android-probe/package-lock.json': 'e6d10b0004fcf98fd5abdb15c3e50fab6efac042',
+ 'mobile/android-probe/probe-npm.sh': '2cee04e14a14b1375e4a773910bce85988b531fa',
+ 'mobile/android-probe/test_native_inventory.py': '6ad00aeb84cbdfd91ba39690d3f5eff2f63aa107',
+ 'mobile/android-probe/verification-metadata.xml': '171aff841a11b8307f5ef1ccdece58a47615cda4',
+ 'mobile/android-probe/verify-build-inventory.py': '018b89b6ec0c407634858164fbf84a642a861a22',
+ 'scripts/diagnostics/android-r3-admission.sh': '365666236452a36ba1c54c8eb951835f8c686791',
+ 'scripts/diagnostics/appium-pilot/contract.test.mjs': 'bf198e13fe028a689769dbfe3ba0cf6dadf12ac5'}
+V2_EXECUTABLE = 'mobile/android-probe/gradle-8.14.8/gradlew'
+
+def v2_fixture():
+    m = V2_EXPECTED.copy()
+    data = fixture(m)
+    pins = dict(a.ENTRIES)
+    pins.update(V2_EXPECTED_DELTA)
+    data['git/trees/'+m['tree']+'?recursive=1']['tree'] = [
+        {'path':path,'sha':digest,'mode':'100755' if path == V2_EXECUTABLE else '100644','type':'blob'}
+        for path,digest in pins.items()]
+    return m, data
+
+class R1Build01aTests(unittest.TestCase):
+    def setUp(self):
+        self.m, self.data = v2_fixture()
+
+    def plan(self):
+        return a.plan(self.m,self.data.__getitem__)
+
+    def tree(self):
+        return self.data['git/trees/'+self.m['tree']+'?recursive=1']['tree']
+
+    def check_key(self, f):
+        return 'commits/'+self.m['head']+'/check-runs?per_page=100&filter='+f
+
+    def test_exact_v2_plan(self):
+        self.assertEqual(len(self.tree()),28)
+        self.assertEqual(self.plan(),{'decision':'ready','candidate':self.m['head'],'workflows':12,'jobs':23,'check_id':None,'release_authorized':False})
+
+    def test_v2_manifest_exact(self):
+        self.assertEqual(a.manifest(self.m),self.m)
+        for field in ('pr','head','base','parent','tree','branch','schema','policy'):
+            changed=dict(self.m,**{field:{'pr':417,'schema':2,'branch':'candidate/other','policy':a.POLICY}.get(field,'f'*40)})
+            with self.subTest(field=field), self.assertRaises(a.Hold):
+                a.manifest(changed)
+
+    def test_v2_pin_missing_wrong_mode_type_duplicate(self):
+        for path in [x['path'] for x in self.tree()]:
+            for kind in ('missing','digest','mode','type','duplicate'):
+                self.m,self.data=v2_fixture(); rows=self.tree(); row=next(x for x in rows if x['path']==path)
+                if kind=='missing':rows.remove(row)
+                elif kind=='digest':row['sha']='0'*40
+                elif kind=='mode':row['mode']='100644' if row['mode']=='100755' else '100755'
+                elif kind=='type':row['type']='tree'
+                else:rows.append(copy.deepcopy(row))
+                with self.subTest(path=path,kind=kind),self.assertRaisesRegex(a.Hold,'policy blob drift'):
+                    self.plan()
+
+    def test_v1_not_accepted_for_v2(self):
+        self.m['policy']=a.POLICY
+        with self.assertRaises(a.Hold):self.plan()
+
+    def test_v2_rejects_v1_tree(self):
+        self.tree()[:]=fixture(self.m)['git/trees/'+self.m['tree']+'?recursive=1']['tree']
+        with self.assertRaisesRegex(a.Hold,'policy blob drift'):self.plan()
+
+    def test_v2_check_policy_binding(self):
+        result=a.payload(self.m,'777')
+        self.assertEqual(result['external_id'],'GOV-AUTO-01:'+self.m['policy']+':'+self.m['head']+':777')
+        self.assertEqual(result['output'],a.OUTPUT)
+        result.update(id=88,app={'id':a.APP})
+        for f in ('latest','all'):
+            row=self.data[self.check_key(f)];row['check_runs'].append(copy.deepcopy(result));row['total_count']+=1
+        self.assertEqual(self.plan()['decision'],'already')
+        self.data[self.check_key('all')]['check_runs'][-1]['external_id']=result['external_id'].replace(self.m['policy'],a.POLICY)
+        with self.assertRaises(a.Hold):self.plan()
+
+    def test_v2_does_not_inherit_historical_check(self):
+        p=a.payload(historical_manifest(),'46044433279'); p.update(external_id='GOV-ADMISSION-04:'+a.old.HEAD+':46044433279',id=140661146635,app={'id':a.APP},head_sha=self.m['head'])
+        key=self.check_key('all');self.data[key]['check_runs'].append(p);self.data[key]['total_count']+=1
+        with self.assertRaises(a.Hold):self.plan()
+
+    def test_v2_job_and_check_fail_closed(self):
+        job_key='actions/runs/45937846094/jobs?per_page=100'
+        for kind in ('job_missing','job_skipped','check_missing','check_duplicate','wrong_base','wrong_parent','wrong_tree','unprotected'):
+            self.m,self.data=v2_fixture();checks=self.data[self.check_key('latest')]
+            if kind=='job_missing':self.data[job_key]['jobs'].clear();self.data[job_key]['total_count']=0
+            elif kind=='job_skipped':self.data[job_key]['jobs'][0]['conclusion']='skipped'
+            elif kind=='check_missing':checks['check_runs'].pop(0);checks['total_count']-=1
+            elif kind=='check_duplicate':checks['check_runs'].append(copy.deepcopy(checks['check_runs'][0]));checks['total_count']+=1
+            elif kind=='wrong_base':self.data['branches/main']['commit']['sha']='f'*40
+            elif kind=='wrong_parent':self.data['git/commits/'+self.m['head']]['parents'][0]['sha']='f'*40
+            elif kind=='wrong_tree':self.data['git/commits/'+self.m['head']]['tree']['sha']='f'*40
+            else:self.data['branches/main']['protected']=False
+            with self.subTest(kind=kind),self.assertRaises(a.Hold):self.plan()
+
+    def test_v2_live_synthetic_revocation_and_dedup(self):
+        probe=Tests();probe.setUp();probe.m=self.m;probe.data=self.data
+        out=probe.live()
+        self.assertEqual(out['state'],'CHECK_EMITTED');self.assertTrue(out['token_revoked']);self.assertFalse(out['release_authorized'])
+        self.assertEqual(probe.posts,[a.payload(self.m,ENV['GITHUB_RUN_ID'])]);self.assertEqual(probe.revoked,['synthetic'])
+        out=probe.live();self.assertEqual(out['state'],'ALREADY_ATTESTED');self.assertEqual(len(probe.posts),1);self.assertEqual(probe.revoked,['synthetic','synthetic'])
+
+    def test_v2_live_mutated_tree_never_posts(self):
+        probe=Tests();probe.setUp();probe.m=self.m;probe.data=self.data
+        self.tree()[0]['sha']='0'*40
+        with self.assertRaisesRegex(a.Hold,'policy blob drift'):probe.live()
+        self.assertEqual(probe.posts,[]);self.assertEqual(probe.revoked,['synthetic'])
+
+    def test_v2_no_fallback_on_policy_mismatch(self):
+        self.tree()[0]['mode']='120000'
+        with self.assertRaisesRegex(a.Hold,'policy blob drift'):a.public_plan(self.m,self.data.__getitem__)
+
+    def test_shipped_manifest_selected_policy(self):
+        # Validate the operational file; never freeze ordinary V1 registration.
+        m = a.load_manifest()
+        if m['policy'] == a.V2_POLICY:
+            self.assertEqual(m, V2_EXPECTED)
+            _, data = v2_fixture()
+        else:
+            self.assertEqual(m['policy'], a.POLICY)
+            data = fixture(m)
+        self.assertEqual(a.plan(m, data.__getitem__),
+                         {'decision':'ready','candidate':m['head'],'workflows':12,
+                          'jobs':23,'check_id':None,'release_authorized':False})
+
+    def test_operational_manifest_accepts_v1_replacement(self):
+        # Exercise the same operational-file test with each supported policy.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            candidate = root/'candidate.json'
+            with patch.object(a,'ROOT',root):
+                for expected in (V2_EXPECTED, historical_manifest(), future_manifest()):
+                    with self.subTest(policy=expected['policy'], pr=expected['pr']):
+                        candidate.write_text(json.dumps(expected), encoding='utf-8')
+                        self.test_shipped_manifest_selected_policy()
+                for invalid in (dict(V2_EXPECTED, policy=a.POLICY),
+                                dict(V2_EXPECTED, head='f'*40),
+                                dict(future_manifest(), policy='unknown')):
+                    candidate.write_text(json.dumps(invalid), encoding='utf-8')
+                    with self.subTest(invalid=invalid), self.assertRaises(a.Hold):
+                        self.test_shipped_manifest_selected_policy()
+
+    def test_v2_manifest_loader_independent_of_v1(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);candidate=root/'candidate.json'
+            candidate.write_text(json.dumps(self.m),encoding='utf-8')
+            with patch.object(a,'ROOT',root):
+                self.assertEqual(a.load_manifest(),self.m)
+                m=historical_manifest();self.assertEqual(a.plan(m,fixture(m).__getitem__)['decision'],'ready')
+
 if __name__=='__main__':unittest.main(verbosity=2)

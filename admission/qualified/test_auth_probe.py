@@ -74,6 +74,11 @@ class Tests(unittest.TestCase):
         for variant,label in cases:
             with self.subTest(expected=label):
                 with self.assertRaises(a.Hold) as ctx: a.jwt(variant,now=1000)
-                self.assertEqual(str(ctx.exception),label)
+                if variant == pss:
+                    # OpenSSL versions reject RSA-PSS at validation or PKCS#1 signing.
+                    # Only these two rejection stages are valid; success is never accepted.
+                    self.assertIn(str(ctx.exception), ('RSA private key validation failed', 'RSA signing process failed'))
+                else:
+                    self.assertEqual(str(ctx.exception),label)
 
 if __name__=='__main__': unittest.main(verbosity=2)

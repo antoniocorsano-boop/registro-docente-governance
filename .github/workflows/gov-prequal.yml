@@ -1,0 +1,59 @@
+name: GOV-PREQUAL-01 — synthetic pre-integration qualification
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'admission/**'
+      - '.github/workflows/gov-auto.yml'
+      - '.github/workflows/gov-prequal.yml'
+permissions: {}
+concurrency:
+  group: gov-prequal-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  synthetic:
+    name: GOV-PREQUAL-01 (${{ matrix.os }})
+    if: github.repository == 'antoniocorsano-boop/registro-docente-governance' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.repo.full_name == github.repository && github.event.pull_request.base.ref == 'main' && github.run_attempt == 1
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 8
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - name: Verify exact PR head and run synthetic suites (no admission or secrets)
+        shell: bash
+        env:
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_BASE_REPO: ${{ github.event.pull_request.base.repo.full_name }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = antoniocorsano-boop/registro-docente-governance
+          test "$GITHUB_EVENT_NAME" = pull_request
+          test "$GITHUB_BASE_REF" = main
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$PR_HEAD_REPO" = "$GITHUB_REPOSITORY"
+          test "$PR_BASE_REPO" = "$GITHUB_REPOSITORY"
+          [[ "$PR_HEAD" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$PR_BASE" =~ ^[0-9a-f]{40}$ ]]
+          umask 077
+          export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0
+          mkdir "$RUNNER_TEMP/gov-prequal"
+          cd "$RUNNER_TEMP/gov-prequal"
+          git init -q
+          git -c credential.helper= -c core.hooksPath=/dev/null fetch --no-tags --depth=1 https://github.com/antoniocorsano-boop/registro-docente-governance.git "$PR_HEAD"
+          git -c core.hooksPath=/dev/null checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$PR_HEAD"
+          printf 'PR head: %s\nPR base: %s\nTree: %s\n' "$PR_HEAD" "$PR_BASE" "$(git rev-parse HEAD^{tree})"
+          cat /etc/os-release
+          openssl version -a
+          python3 --version
+          cd admission/qualified
+          sha256sum -c SHA256SUMS
+          python3 -m unittest -v test_remote test_emitter test_auth_probe test_integration.IntegrationTests
+          cd ..
+          python3 -m unittest -v test_gov_auto test_http
+          printf 'GOV-PREQUAL-01 synthetic suites passed for head %s, base %s. No admission or release authorization.\n' "$PR_HEAD" "$PR_BASE" >> "$GITHUB_STEP_SUMMARY"
